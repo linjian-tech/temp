@@ -1,5 +1,5 @@
 #include "utils.hpp"
-
+#include "ggml.h"
 #include "common.h"
 #include "llama.h"
 #include "grammar-parser.h"
@@ -72,6 +72,13 @@ struct server_task {
 
     bool infill    = false;
     bool embedding = false;
+
+    //jinyu: add attribute
+    struct ggml_tensor* trans_tensor;
+    int s_layer;
+    int e_layer;
+    llama_token token_id;
+    float* ggml_tensor_data;
 };
 
 struct server_task_result {
@@ -82,6 +89,9 @@ struct server_task_result {
 
     bool stop;
     bool error;
+
+    //linjian
+    std::vector<float> ggml_tensor_data;
 };
 
 struct server_task_multi {
@@ -131,6 +141,12 @@ struct server_slot {
 
     slot_state state = SLOT_STATE_IDLE;
     slot_command command = SLOT_COMMAND_NONE;
+
+    //jinyu: add ggml tensor
+    struct ggml_tensor* trans_tensor;
+    int s_layer;
+    int e_layer;
+    float* ggml_tensor_data;
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
@@ -205,6 +221,11 @@ struct server_slot {
         n_past_se          = 0;
 
         generated_token_probs.clear();
+    }
+
+    //jinyu
+    void set_transfer_feature(ggml_tensor* trans_tensor) {
+        this->trans_tensor = trans_tensor;
     }
 
     bool has_budget(gpt_params &global_params) {
@@ -643,6 +664,8 @@ struct server_context {
     server_response queue_results;
 
     server_metrics metrics;
+
+    std::vector<std::string> results_vector;
 
     ~server_context() {
         if (ctx) {
@@ -1340,6 +1363,21 @@ struct server_context {
         queue_results.send(res);
     }
 
+    //jinyu: write features to results
+    void send_feature_res(server_slot& slot) {
+        server_task_result res;
+        res.id = slot.id_task;
+        res.id_multi = slot.id_multi;
+        res.error = false;
+        res.stop = true;
+        // linjian: transform pointer to vector
+        float* data = (float *)(slot.trans_tensor->data);
+        std::vector<float> ve (data, data + ggml_nelements(slot.trans_tensor));
+        res.ggml_tensor_data = ve;
+        //res.ggml_tensor_data = (float *)(slot.trans_tensor->data);
+        queue_results.send(res);
+    }
+
     void request_completion(int id_task, int id_multi, json data, bool infill, bool embedding) {
         server_task task;
         task.id        = id_task;
@@ -1349,6 +1387,19 @@ struct server_context {
         task.infill    = infill;
         task.embedding = embedding;
         task.type      = SERVER_TASK_TYPE_COMPLETION;
+
+        // jinyu: add data
+        struct ggml_tensor* trans_tensor = {};
+        int s_layer = json_value(task.data, "s_layer", 0);
+        int e_layer = json_value(task.data, "e_layer", 31);
+        task.trans_tensor = trans_tensor;
+        task.s_layer = s_layer;
+        task.e_layer = e_layer;
+        task.token_id = json_value(task.data, "token_id", 0);
+        // linjian : vector transform to pointer
+        std::vector<float> temp_vec;
+        task.ggml_tensor_data = (json_value(task.data, "ggml_tensor_data", temp_vec).data());
+        //task.ggml_tensor_data = json_value(task.data, "ggml_tensor_data", nullptr);
 
         // when a completion task's prompt array is not a singleton, we split it into multiple requests
         // otherwise, it's a single-prompt task, we actually queue it
@@ -1438,6 +1489,13 @@ struct server_context {
                     slot->id_multi  = task.id_multi;
                     slot->infill    = task.infill;
                     slot->embedding = task.embedding;
+
+                    // jinyu: add inp_tensor
+                    slot->trans_tensor = task.trans_tensor;
+                    slot->s_layer = task.s_layer;
+                    slot->e_layer = task.e_layer;
+                    slot->sampled = task.token_id;
+                    slot->ggml_tensor_data = task.ggml_tensor_data;
 
                     if (!launch_slot_with_data(*slot, task.data)) {
                         // send error result
@@ -1563,8 +1621,12 @@ struct server_context {
             system_prompt_update();
         }
 
+        const int64_t n_layer = get_transfer_nlayer(ctx);
+        int s_layer, e_layer;
         // release slots
         for (auto & slot : slots) {
+            s_layer = slot.s_layer;
+            e_layer = slot.e_layer;
             if (slot.command == SLOT_COMMAND_RELEASE) {
                 slot.state       = SLOT_STATE_IDLE;
                 slot.command     = SLOT_COMMAND_NONE;
@@ -1604,7 +1666,8 @@ struct server_context {
                 return true;
             }
         }
-
+        // if there are multiple node, then we need comment the following code block
+        if(e_layer-s_layer+1==n_layer)
         {
             LOG_VERBOSE("posting NEXT_RESPONSE", {});
 
@@ -1658,7 +1721,7 @@ struct server_context {
         // start populating the batch for this iteration
         llama_batch_clear(batch);
 
-        // frist, add sampled tokens from any ongoing sequences
+        // first, add sampled tokens from any ongoing sequences (decode any currently ongoing sequences)
         for (auto & slot : slots) {
             if (slot.state == SLOT_STATE_IDLE) {
                 continue;
@@ -1884,7 +1947,7 @@ struct server_context {
                             }
                         }
 
-                        llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false);
+                        llama_batch_add(batch, prompt_tokens[slot.n_past], system_tokens.size() + slot_npast, { slot.id + 1 }, false);  // no need to get logits
 
                         if (slot.params.cache_prompt) {
                             slot.cache_tokens.push_back(prompt_tokens[slot.n_past]);
@@ -1940,6 +2003,113 @@ struct server_context {
             {"n_tokens", batch.n_tokens},
         });
 
+        //jinyu: different processing methods for different node
+        //start---
+        struct ggml_tensor* trans_tensor;
+        float* ggml_tensor_data;
+        for (auto& slot : slots) {
+            s_layer = slot.s_layer;
+            e_layer = slot.e_layer;
+            trans_tensor = slot.trans_tensor;
+            ggml_tensor_data = slot.ggml_tensor_data;
+            break;
+        }
+        if(s_layer!=0){  // start from node 2, we neglect the batching
+            llama_set_s_e_inference(ctx, s_layer,e_layer, trans_tensor, ggml_tensor_data);  // assign three values to attributes of ctx
+            int32_t i=0; // assume a batch
+            const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+            llama_batch batch_view = {
+                    n_tokens,
+                    batch.token    + i,
+                    nullptr,
+                    batch.pos      + i,
+                    batch.n_seq_id + i,
+                    batch.seq_id   + i,
+                    batch.logits   + i,
+                    0, 0, 0, // unused
+            };
+            const int ret = llama_decode(ctx, batch_view); // jinyu: return in ctx
+            for (auto& slot : slots) {
+                slot.set_transfer_feature(get_transfer_feature(ctx));
+                if(e_layer+1!=n_layer) // if it is not the last node, send the feature
+                    send_feature_res(slot);
+            }
+
+            if(e_layer+1==n_layer){ // process the output result
+                if (ret != 0) {
+                    if (n_batch == 1 || ret < 0) {
+                        // if you get here, it means the KV cache is full - try increasing it via the context size
+                        LOG_TEE("%s : failed to decode the batch, n_batch = %d, ret = %d\n", __func__, n_batch, ret);
+                        return false;
+                    }
+
+                    LOG_TEE("%s : failed to find free space in the KV cache, retrying with smaller n_batch = %d\n", __func__, n_batch / 2);
+
+                    // retry with half the batch size to try to find a free slot in the KV cache
+                    n_batch /= 2;
+                    i -= n_batch;
+                }
+
+                for (auto & slot : slots) {
+                    if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch < (int) i || slot.i_batch >= (int) (i + n_tokens)) {
+                        continue;
+                    }
+
+                    // prompt evaluated for embedding
+                    if (slot.embedding) {
+                        send_embedding(slot, batch_view);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue;
+                    }
+
+                    completion_token_output result;
+                    const llama_token id = llama_sampling_sample(slot.ctx_sampling, ctx, NULL, slot.i_batch - i);
+
+                    llama_sampling_accept(slot.ctx_sampling, ctx, id, true);
+
+                    slot.n_decoded += 1;
+                    if (slot.n_decoded == 1) {
+                        slot.t_start_generation = ggml_time_us();
+                        slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                        metrics.on_prompt_eval(slot);
+                    }
+
+                    llama_token_data_array cur_p = { slot.ctx_sampling->cur.data(), slot.ctx_sampling->cur.size(), false };
+                    result.tok = id;
+
+                    const int32_t n_probs = slot.sparams.n_probs;
+                    if (slot.sparams.temp <= 0 && n_probs > 0) {
+                        // for llama_sample_token_greedy we need to sort candidates
+                        llama_sample_softmax(ctx, &cur_p);
+                    }
+
+                    for (size_t i = 0; i < std::min(cur_p.size, (size_t) n_probs); ++i) {
+                        result.probs.push_back({
+                                                       cur_p.data[i].id,
+                                                       cur_p.data[i].p
+                                               });
+                    }
+
+                    if (!process_token(result, slot)) {
+                        slot.release();
+                        slot.print_timings();
+                        send_final_response(slot);
+                        metrics.on_prediction(slot);
+                    }
+
+                    slot.i_batch = -1;
+                }
+            }
+
+
+            LOG_VERBOSE("slots updated", {});
+            return true;
+
+        }
+        //end---
+
+
         // process the created batch of tokens
         for (int32_t i = 0; i < (int32_t) batch.n_tokens; i += n_batch) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
@@ -1984,73 +2154,95 @@ struct server_context {
                 0, 0, 0, // unused
             };
 
-            const int ret = llama_decode(ctx, batch_view);
+            //jinyu: set the start_layer and end_layer into ctx
+            //jinyu TODO: need to classify the first node and other node because of batching!!!
+            int s_layer,e_layer;
+            struct ggml_tensor* trans_tensor;
+            float* ggml_tensor_data;
+            for (auto& slot : slots) {
+                s_layer = slot.s_layer;
+                e_layer = slot.e_layer;
+                trans_tensor = slot.trans_tensor;
+                ggml_tensor_data = slot.ggml_tensor_data;
+                break;
+            }
+            llama_set_s_e_inference(ctx, s_layer,e_layer, trans_tensor, ggml_tensor_data);  // assign three values to attributes of ctx
 
-            if (ret != 0) {
-                if (n_batch == 1 || ret < 0) {
-                    // if you get here, it means the KV cache is full - try increasing it via the context size
-                    LOG_TEE("%s : failed to decode the batch, n_batch = %d, ret = %d\n", __func__, n_batch, ret);
-                    return false;
-                }
+            const int ret = llama_decode(ctx, batch_view); // jinyu: return in ctx
 
-                LOG_TEE("%s : failed to find free space in the KV cache, retrying with smaller n_batch = %d\n", __func__, n_batch / 2);
-
-                // retry with half the batch size to try to find a free slot in the KV cache
-                n_batch /= 2;
-                i -= n_batch;
-
-                continue;
+            for (auto& slot : slots) {
+                slot.set_transfer_feature(get_transfer_feature(ctx));
+                if(e_layer + 1 != n_layer)
+                    send_feature_res(slot);
             }
 
-            for (auto & slot : slots) {
-                if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch < (int) i || slot.i_batch >= (int) (i + n_tokens)) {
+            if(e_layer + 1 == n_layer){  // e_layer+1==n_layer
+                if (ret != 0) {
+                    if (n_batch == 1 || ret < 0) {
+                        // if you get here, it means the KV cache is full - try increasing it via the context size
+                        LOG_TEE("%s : failed to decode the batch, n_batch = %d, ret = %d\n", __func__, n_batch, ret);
+                        return false;
+                    }
+
+                    LOG_TEE("%s : failed to find free space in the KV cache, retrying with smaller n_batch = %d\n", __func__, n_batch / 2);
+
+                    // retry with half the batch size to try to find a free slot in the KV cache
+                    n_batch /= 2;
+                    i -= n_batch;
+
                     continue;
                 }
 
-                // prompt evaluated for embedding
-                if (slot.embedding) {
-                    send_embedding(slot, batch_view);
-                    slot.release();
+                for (auto & slot : slots) {
+                    if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch < (int) i || slot.i_batch >= (int) (i + n_tokens)) {
+                        continue;
+                    }
+
+                    // prompt evaluated for embedding
+                    if (slot.embedding) {
+                        send_embedding(slot, batch_view);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue;
+                    }
+
+                    completion_token_output result;
+                    const llama_token id = llama_sampling_sample(slot.ctx_sampling, ctx, NULL, slot.i_batch - i);
+
+                    llama_sampling_accept(slot.ctx_sampling, ctx, id, true);
+
+                    slot.n_decoded += 1;
+                    if (slot.n_decoded == 1) {
+                        slot.t_start_generation = ggml_time_us();
+                        slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                        metrics.on_prompt_eval(slot);
+                    }
+
+                    llama_token_data_array cur_p = { slot.ctx_sampling->cur.data(), slot.ctx_sampling->cur.size(), false };
+                    result.tok = id;
+
+                    const int32_t n_probs = slot.sparams.n_probs;
+                    if (slot.sparams.temp <= 0 && n_probs > 0) {
+                        // for llama_sample_token_greedy we need to sort candidates
+                        llama_sample_softmax(ctx, &cur_p);
+                    }
+
+                    for (size_t i = 0; i < std::min(cur_p.size, (size_t) n_probs); ++i) {
+                        result.probs.push_back({
+                                                       cur_p.data[i].id,
+                                                       cur_p.data[i].p
+                                               });
+                    }
+
+                    if (!process_token(result, slot)) {
+                        slot.release();
+                        slot.print_timings();
+                        send_final_response(slot);
+                        metrics.on_prediction(slot);
+                    }
+
                     slot.i_batch = -1;
-                    continue;
                 }
-
-                completion_token_output result;
-                const llama_token id = llama_sampling_sample(slot.ctx_sampling, ctx, NULL, slot.i_batch - i);
-
-                llama_sampling_accept(slot.ctx_sampling, ctx, id, true);
-
-                slot.n_decoded += 1;
-                if (slot.n_decoded == 1) {
-                    slot.t_start_generation = ggml_time_us();
-                    slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                    metrics.on_prompt_eval(slot);
-                }
-
-                llama_token_data_array cur_p = { slot.ctx_sampling->cur.data(), slot.ctx_sampling->cur.size(), false };
-                result.tok = id;
-
-                const int32_t n_probs = slot.sparams.n_probs;
-                if (slot.sparams.temp <= 0 && n_probs > 0) {
-                    // for llama_sample_token_greedy we need to sort candidates
-                    llama_sample_softmax(ctx, &cur_p);
-                }
-
-                for (size_t i = 0; i < std::min(cur_p.size, (size_t) n_probs); ++i) {
-                    result.probs.push_back({
-                        cur_p.data[i].id,
-                        cur_p.data[i].p
-                    });
-                }
-
-                if (!process_token(result, slot)) {
-                    slot.release();
-                    slot.print_timings();
-                    send_final_response(slot);
-                    metrics.on_prediction(slot);
-                }
-
-                slot.i_batch = -1;
             }
         }
 
@@ -2615,6 +2807,9 @@ int main(int argc, char ** argv) {
     gpt_params    params;
     server_params sparams;
 
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
     // struct that contains llama context and inference
     server_context ctx_server;
 
@@ -2628,8 +2823,6 @@ int main(int argc, char ** argv) {
         params.model_alias = params.model;
     }
 
-    llama_backend_init();
-    llama_numa_init(params.numa);
 
     LOG_INFO("build info", {
         {"build",  LLAMA_BUILD_NUMBER},
@@ -3047,9 +3240,302 @@ int main(int argc, char ** argv) {
         }
     };
 
-    svr.Post("/completion", completions); // legacy
     svr.Post("/completions", completions);
     svr.Post("/v1/completions", completions);
+
+    //linjian: add masternode schedule logic
+    /*
+     * how to serialize ggml_tensor->data --> transform pointer to vector, then put it into json
+     *     float* data = (float*)(ggml_tenosr-<data);
+     *     std::vector<float> ve (data, data+ggml_nelements(ggml_tensor));
+     *     json = output_json = {"ggml_tensor_data", ve};
+     *     output = output_json.dump();
+     *
+     * how to deserialize ggml_tensor->data --> get vector from json, transform vector to pointer
+     *     output_json = json::parse(output);
+     *     float* vecPtr = output_json['ggml_tensor_data'].data();
+     *     ggml_tensor->data = (void*)(vecPtr);
+     */
+//    const auto masternode_schedule = [&validate_api_key](const httplib::Request & req, httplib::Response & res){
+//        res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+//        if (!validate_api_key(req, res)) {
+//            return;
+//        }
+//        // store start layer index and end layer index and currently set up manually
+//        // TODO： need a model layer devided strategy
+//        std::vector<std::string> vec_worknode_ipaddress;
+//        vec_worknode_ipaddress.push_back("http://127.0.0.1:8081");
+//        vec_worknode_ipaddress.push_back("http://127.0.0.1:8082");
+//        std::vector<std::pair<int, int>> vec_worknode_layer_index;
+//        vec_worknode_layer_index.push_back(std::make_pair(0,31));
+//        vec_worknode_layer_index.push_back(std::make_pair(3,4));
+//
+//        json input_json;
+//        json output_json;
+//
+//        // worknode output content
+//        int token_id = 0;
+//        int slot_id = -1;
+//        bool stop = false;
+//        // ggml_tensor->data: std::vector<float> vector_data
+//
+//        // user requrest content
+//        std::string prompt = req.body;
+//        // worknode response content
+//        std::string response_str = "";
+//
+//
+//        const auto chunked_content_provider = [&](size_t, httplib::DataSink & sink){
+//            while (true) {
+//                //for (int i = 0; i < vec_worknode_layer_index.size(); i++) {
+//                for (int i = 0; i < 1; i++) {
+//                    if (i == 0) {
+//                        // initialize json data, and transform json to json string
+//                        std::vector<float> vector_data;
+//                        input_json = {
+//                                {"prompt",           prompt},
+//                                {"s_layer",          vec_worknode_layer_index[i].first},
+//                                {"e_layer",          vec_worknode_layer_index[i].second},
+//                                {"ggml_tensor_data", vector_data},
+//                                {"token_id",         token_id},
+//                                {"slot_id",          slot_id}
+//                        };
+//                        std::string input = input_json.dump();
+//
+//                        // send post request to worknode
+//                        httplib::Client cli(vec_worknode_ipaddress[i]); // worknode ip address and port
+//                        auto forwarded_res = cli.Post("/masternode_schedule", input, "application/json; charset=utf-8");
+//                        response_str = forwarded_res->body;
+//
+//
+//                    } else {
+//                        slot_id = output_json["slot_id"];
+//                        std::vector<float> vector_data = output_json["vector_data"];
+//                        input_json = {
+//                                {"prompt",           prompt},
+//                                {"s_layer",          vec_worknode_layer_index[i].first},
+//                                {"e_layer",          vec_worknode_layer_index[i].second},
+//                                {"ggml_tensor_data", vector_data},
+//                                {"token_id",         token_id},
+//                                {"slot_id",          slot_id}
+//                        };
+//                        std::string input = input_json.dump();
+//
+//                        httplib::Client cli(vec_worknode_ipaddress[i]); // worknode ip address and port
+//                        auto forwarded_res = cli.Post("/masternode_schedule", input, "application/json; charset=utf-8");
+//                        response_str = forwarded_res->body;
+//
+//                    }
+//                    output_json = json::parse(response_str);
+//
+//                }
+//                sink.write(response_str.c_str(), response_str.size());
+//                stop = output_json["stop"];
+//                token_id = output_json["token_id"];
+//                if (stop) {
+//                    break;
+//                }
+//            }
+//            sink.done();
+//            return true;
+//        };
+//        res.set_chunked_content_provider("text/event-stream", chunked_content_provider);
+//
+//    };
+
+    const auto handle_worknode_initialize = [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+        if (!validate_api_key(req, res)) {
+            return;
+        }
+
+        json data_input = json::parse(req.body);
+        std::string stri = data_input["prompt"];
+        json data = json::parse(stri);
+
+        const int id_task = ctx_server.queue_tasks.get_new_id();
+
+        ctx_server.queue_results.add_waiting_task_id(id_task);
+        ctx_server.request_completion(id_task, -1, data, false, false);
+
+        if (data_input["e_layer"] == 31){
+            if (!json_value(data, "stream", false)) {
+                server_task_result result = ctx_server.queue_results.recv(id_task);
+                if (!result.error && result.stop) {
+                    res.set_content(result.data.dump(-1, ' ', false, json::error_handler_t::replace), "application/json; charset=utf-8");
+                }
+
+                ctx_server.queue_results.remove_waiting_task_id(id_task);
+            } else {
+                server_task_result result = ctx_server.queue_results.recv(id_task);
+                if (!result.error) {
+                    const std::string str =
+                            "data: " +
+                            result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
+                            "\n\n";
+
+                    LOG_VERBOSE("data stream", {
+                        { "to_send", str }
+                    });
+
+                    httplib::Client cli("http://127.0.0.1:8080");
+                    auto forwarded_res = cli.Post("/masternode_passing", str, "text/plain");
+                }
+
+                res.set_content("passing success!","text/plain");
+            }
+        }else {
+            server_task_result result = ctx_server.queue_results.recv(id_task);
+            std::vector<float> vector_data = result.ggml_tensor_data;
+            json input_json;
+            input_json = {
+                    {"prompt",           data_input["prompt"]},
+                    {"s_layer",          16},
+                    {"e_layer",          31},
+                    {"ggml_tensor_data", vector_data},
+                    {"token_id",         0},
+                    {"slot_id",          -1}
+            };
+            std::string input = input_json.dump();
+
+            httplib::Client cli("http://127.0.0.1:8082"); // worknode ip address and port
+            auto forwarded_res = cli.Post("/worknode_initialize", input, "application/json; charset=utf-8");
+        }
+
+    };
+
+    // linjian : add masternode schedule
+    const auto handle_completions = [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+        if (!validate_api_key(req, res)) {
+            return;
+        }
+        json input_json;
+        std::vector<float> vector_data;
+        input_json = {
+                {"prompt",           req.body},
+                {"s_layer",          0},
+                {"e_layer",          15},
+                {"ggml_tensor_data", vector_data},
+                {"token_id",         0},
+                {"slot_id",          -1},
+                {"token",     ""}
+        };
+        std::string input = input_json.dump();
+
+        // pass post request.body to worknode 1, and add some new inforation into input
+        httplib::Client cli("http://127.0.0.1:8081"); // worknode1 ip address and port
+        auto forwarded_res = cli.Post("/worknode_initialize", input, "application/json");
+
+//        httplib::Client cli("http://127.0.0.1:8081"); // worknode ip address and port
+//        auto forwarded_res = cli.Post("/worknode", req.body, "application/json");// only send the original prompt
+
+        const auto chunked_content_provider = [&ctx_server](size_t, httplib::DataSink & sink) {
+            while (true) {
+                std::string str = "";
+                //blocking until receive new result
+                while(true) {
+                    if(!ctx_server.results_vector.empty()) {
+                        str = ctx_server.results_vector[0];
+                        ctx_server.results_vector.erase(ctx_server.results_vector.begin());
+                        std::cout<<int(ctx_server.results_vector.size());
+                        break;
+                    }
+                }
+                if(str != "") {
+                    sink.write(str.c_str(), str.size());
+                }
+            }
+            sink.done();
+            return true;
+        };
+        res.set_chunked_content_provider("text/event-stream", chunked_content_provider);
+    };
+
+
+    // receive the token of final worknode, the store result to masternode outputstream and pass new content to first worknode
+    const auto handle_masternode_passing= [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+        if (!validate_api_key(req, res)) {
+            return;
+        }
+        json data_input = json::parse(req.body);
+        std::string token = data_input["token"];
+        ctx_server.results_vector.push_back(token); //store result token
+        httplib::Client cli("http://127.0.0.1:8081");
+        auto forwarded_res = cli.Post("/worknode_notify", req.body, "application/json");
+
+        res.set_content("passing success!","text/plain");
+    };
+
+    const auto handle_worknode_notify= [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+        if (!validate_api_key(req, res)) {
+            return;
+        }
+
+        {
+            LOG_VERBOSE("posting NEXT_RESPONSE", {});
+
+            server_task task;
+            task.type      = SERVER_TASK_TYPE_NEXT_RESPONSE;
+            task.id_target = -1;
+
+            ctx_server.queue_tasks.post(task);
+        }
+
+        json data_input = json::parse(req.body);
+        std::string stri = data_input["prompt"];
+        json data = json::parse(stri);
+
+        int id_task = 0;
+        if (data_input["e_layer"] == 31) {
+            server_task_result result = ctx_server.queue_results.recv(id_task);
+            if (!result.error) {
+                const std::string str =
+                        "data: " +
+                        result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
+                        "\n\n";
+
+                LOG_VERBOSE("data stream", {
+                    { "to_send", str }
+                });
+                httplib::Client cli("http://127.0.0.1:8080");
+                auto forwarded_res = cli.Post("/masternode_passing", str, "text/plain");
+            }
+            res.set_content("start worknode success!", "text/plain");
+        }else {
+            server_task_result result = ctx_server.queue_results.recv(id_task);
+            std::vector<float> vector_data = result.ggml_tensor_data;
+            json input_json;
+            input_json = {
+                    {"prompt",           data_input["prompt"]},
+                    {"s_layer",          16},
+                    {"e_layer",          31},
+                    {"ggml_tensor_data", vector_data},
+                    {"token_id",         0},
+                    {"slot_id",          -1},
+                    {"token",            ""}
+            };
+            std::string input = input_json.dump();
+
+            httplib::Client cli("http://127.0.0.1:8082"); // worknode ip address and port
+            auto forwarded_res = cli.Post("/handle_worknode_notify", input, "application/json; charset=utf-8");
+        }
+    };
+
+    // worknode post processing functions
+    svr.Post("/worknode_initialize",        handle_worknode_initialize);
+    svr.Post("/worknode_notify",            handle_worknode_notify);
+
+    // masternode post processing functions
+    svr.Post("/masternode_passing",         handle_masternode_passing);
+    // if you want to start llama cpp by multiple node
+
+    //svr.Post("/completion",          handle_completions);
+
+    // if you want to start llama cpp by single node
+    svr.Post("/completion", completions);
 
     svr.Get("/v1/models", [&params, &model_meta](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
