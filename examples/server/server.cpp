@@ -669,6 +669,7 @@ struct server_context {
 
     std::vector<std::string> results_vector;
     bool stop = false;
+    int task_id = -1;
 
     ~server_context() {
         if (ctx) {
@@ -3295,6 +3296,7 @@ int main(int argc, char ** argv) {
         const int id_task = ctx_server.queue_tasks.get_new_id();
 
         ctx_server.queue_results.add_waiting_task_id(id_task);
+        ctx_server.task_id = id_task;
         ctx_server.request_completion(id_task, -1, data, false, false);
 
         if (data["e_layer"] == 31){
@@ -3346,6 +3348,7 @@ int main(int argc, char ** argv) {
             passing_data["token_id"] = 0;
             passing_data["slot_id"] = -1;
             passing_data["token"] = "";
+            passing_data["stop"] = result.stop;
             std::string input = passing_data.dump();
 
             httplib::Client cli("http://127.0.0.1:8082"); // worknode ip address and port
@@ -3414,6 +3417,15 @@ int main(int argc, char ** argv) {
         if(!data_input["stop"]) {
             httplib::Client cli("http://127.0.0.1:8081");
             auto forwarded_res = cli.Post("/worknode_notify", req.body, "application/json");
+        }else{
+            json input_json;
+            input_json = {
+                    {"e_layer",          15}
+
+            };
+            std::string input = input_json.dump();
+            httplib::Client cli("http://127.0.0.1:8081");
+            auto forwarded_res = cli.Post("/worknode_release_slot", input, "application/json; charset=utf-8");
         }
 
         res.set_content("passing success!","text/plain");
@@ -3425,6 +3437,7 @@ int main(int argc, char ** argv) {
             return;
         }
         json data_input = json::parse(req.body);
+        int id_task = ctx_server.task_id;
         {
             LOG_VERBOSE("posting NEXT_RESPONSE", {});
 
@@ -3440,7 +3453,6 @@ int main(int argc, char ** argv) {
             ctx_server.queue_tasks.post(task);
         }
 
-        int id_task = 0;
         if (data_input["e_layer"] == 31) {
             server_task_result result = ctx_server.queue_results.recv(id_task);
             if (!result.error) {
@@ -3480,6 +3492,7 @@ int main(int argc, char ** argv) {
                     {"slot_id",          data_input["slot_id"]},
                     {"s_layer",          15},
                     {"e_layer",          31},
+                    {"stop",             data_input["stop"]},
             };
 
             std::string input = input_json.dump();
@@ -3489,9 +3502,33 @@ int main(int argc, char ** argv) {
         }
     };
 
+    const auto handle_worknode_release_slot = [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+        if (!validate_api_key(req, res)) {
+            return;
+        }
+        int id_task = ctx_server.task_id;
+
+        ctx_server.request_cancel(id_task);
+        ctx_server.queue_results.remove_waiting_task_id(id_task);
+        ctx_server.stop = false;
+        json data_input = json::parse(req.body);
+        if (data_input["e_layer"] != 31) {
+            json input_json;
+            input_json = {
+                    {"e_layer",          31}
+
+            };
+            std::string input = input_json.dump();
+            httplib::Client cli("http://127.0.0.1:8082"); // worknode ip address and port
+            auto forwarded_res = cli.Post("/worknode_release_slot", input, "application/json; charset=utf-8");
+        }
+    };
+
     // worknode post processing functions
     svr.Post("/worknode_initialize",        handle_worknode_initialize);
     svr.Post("/worknode_notify",            handle_worknode_notify);
+    svr.Post("/worknode_release_slot",      handle_worknode_release_slot);
 
     // masternode post processing functions
     svr.Post("/masternode_passing",         handle_masternode_passing);
