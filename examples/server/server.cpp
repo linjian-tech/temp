@@ -94,6 +94,7 @@ struct server_task_result {
 
     //linjian
     std::vector<float> ggml_tensor_data;
+    bool incomplete = false;
 };
 
 struct server_task_multi {
@@ -484,6 +485,14 @@ struct server_queue {
 
             while (true) {
                 std::unique_lock<std::mutex> lock(mutex_tasks);
+
+                if (!queue_tasks.empty()) {
+                    for (auto task: queue_tasks) {
+                        fprintf(stdout, "start loop tasks:: %ld\n", queue_tasks.size());
+                        std::cout << "task type:" << static_cast<int>(task.type) << std::endl;
+                    }
+                }
+
                 if (queue_tasks.empty()) {
                     lock.unlock();
                     break;
@@ -1158,6 +1167,19 @@ struct server_context {
 
         if (incomplete) {
             slot.has_next_token = true;
+            server_task_result res;
+            res.id       = slot.id_task;
+            res.id_multi = slot.id_multi;
+            res.error    = false;
+            res.stop     = false;
+            res.incomplete = false;
+            res.data     = json {
+                    {"stop",       false},
+                    {"id_slot",    slot.id},
+                    {"multimodal", false},
+                    {"token_id",    slot.sampled}
+            };
+            queue_results.send(res);
         }
 
         // check the limits
@@ -1172,6 +1194,7 @@ struct server_context {
             });
         }
 
+        std::cout<< "tok and eos:"<<result.tok<<"  "<<llama_token_eos(model)<<std::endl;
         if (result.tok == llama_token_eos(model)) {
             slot.stopped_eos    = true;
             slot.has_next_token = false;
@@ -1190,7 +1213,7 @@ struct server_context {
             {"stopped_limit",  slot.stopped_limit},
             {"stopping_word",  slot.stopping_word},
         });
-
+        std::cout<< "slot.has_next_token:"<<slot.has_next_token<< "token "<< token_str<<" content "<<result.text_to_send<<std::endl;
         return slot.has_next_token; // continue
     }
 
@@ -1259,6 +1282,7 @@ struct server_context {
         res.id_multi = slot.id_multi;
         res.error    = false;
         res.stop     = false;
+        res.incomplete = false;
         res.data     = json {
                 {"content",    tkn.text_to_send},
                 {"stop",       false},
@@ -1391,6 +1415,7 @@ struct server_context {
         float* data = (float *)(slot.trans_tensor->data);
         std::vector<float> ve (data, data + ggml_nelements(slot.trans_tensor));
         res.ggml_tensor_data = ve;
+        res.incomplete = false;
         //res.ggml_tensor_data = (float *)(slot.trans_tensor->data);
         queue_results.send(res);
     }
@@ -3331,9 +3356,10 @@ int main(int argc, char ** argv) {
                     result_data["s_layer"] = 0;
                     result_data["e_layer"] = 15;
                     result_data["stop"] = result.stop;
+                    result_data["incomplete"] = result.incomplete;
                     std::string input = result_data.dump();
 
-                    httplib::Client cli("http://127.0.0.1:8083");
+                    httplib::Client cli("http://127.0.0.1:8080");
                     auto forwarded_res = cli.Post("/masternode_passing", input, "application/json");
                 }
                 res.set_content("passing success!","text/plain");
@@ -3364,6 +3390,7 @@ int main(int argc, char ** argv) {
         if (!validate_api_key(req, res)) {
             return;
         }
+        std::cout<<"req.body: "<<req.body<<std::endl;
         std::vector<float> vector_data;
         json data = json::parse(req.body);
         data["s_layer"] = 0;
@@ -3412,10 +3439,12 @@ int main(int argc, char ** argv) {
             return;
         }
         json data_input = json::parse(req.body);
-        ctx_server.stop = data_input["stop"];
-        std::string token = data_input["token"];
-        std::cout<<"Dec: handle_masternode_passing: token"<<token<<" stop: "<<ctx_server.stop << std::endl;
-        ctx_server.results_vector.push_back(token); //store result token
+        if (!data_input["incomplete"]) {
+            ctx_server.stop = data_input["stop"];
+            std::string token = data_input["token"];
+            std::cout << "Dec: handle_masternode_passing: token" << token << " stop: " << ctx_server.stop << std::endl;
+            ctx_server.results_vector.push_back(token); //store result token
+        }
         if(!data_input["stop"]) {
             httplib::Client cli("http://127.0.0.1:8081");
             auto forwarded_res = cli.Post("/worknode_notify", req.body, "application/json");
@@ -3438,7 +3467,6 @@ int main(int argc, char ** argv) {
         if (!validate_api_key(req, res)) {
             return;
         }
-        std::cout<<"Dec: node 1, notify: req.body:" << req.body<< std::endl;
         json data_input = json::parse(req.body);
         int id_task = ctx_server.task_id;
         {
@@ -3458,6 +3486,7 @@ int main(int argc, char ** argv) {
 
         if (data_input["e_layer"] == 31) {
             server_task_result result = ctx_server.queue_results.recv(id_task);
+
             if (!result.error) {
                 const std::string str =
                         "data: " +
@@ -3479,8 +3508,9 @@ int main(int argc, char ** argv) {
                 result_data["s_layer"] = 0;
                 result_data["e_layer"] = 15;
                 result_data["stop"] = result.stop;
+                result_data["incomplete"] = result.incomplete;
                 std::string input = result_data.dump();
-                httplib::Client cli("http://127.0.0.1:8083");
+                httplib::Client cli("http://127.0.0.1:8080");
 
                 auto forwarded_res = cli.Post("/masternode_passing", input, "application/json; charset=utf-8");
 

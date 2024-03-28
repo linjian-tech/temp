@@ -8750,7 +8750,7 @@ static void demo_pre(
         int  n_layers){
 
     int s_layer = lctx.s_layer, e_layer = lctx.e_layer;
-    
+
     struct ggml_tensor* inp_tokens = ggml_graph_get_tensor(gf, "inp_tokens (view)");
     if (inp_tokens == NULL) {
         fprintf(stderr, "%s: tensor 'inp_tokens' not found\n", __func__);
@@ -8771,7 +8771,7 @@ static void demo_pre(
     }
 
     //GGML_ASSERT(inp0 == gf->nodes[0]);
-    
+
     // setup the computation graph
     {
 
@@ -8791,7 +8791,7 @@ static void demo_pre(
         const int idx_l0 = ggml_graph_get_node_idx_jinyu(gf, name_l0);
         const int idx_l1 = e_layer != n_layers-1 ? ggml_graph_get_node_idx_jinyu(gf, name_l1) + 1 : gf->n_nodes;
         fprintf(stdout, "%s, %s, %d, %d\n", name_l0, name_l1, idx_l0, idx_l1);
-        
+
         if (idx_l0 < 0 || idx_l1 < 0) {
             fprintf(stderr, "%s: layer input nodes not found\n", __func__);
             return;
@@ -8800,7 +8800,7 @@ static void demo_pre(
         // attach the input data to all nodes that need it
         // TODO: not great - should be able to do this without modifying the compute graph (see next TODO below)
         if (s_layer > 0) {
-            // jinyu: change the input to inp0 
+            // jinyu: change the input to inp0
             for (int i = idx_l0; i < idx_l1; i++) {
                 if (gf->nodes[i]->src[0] == gf->nodes[idx_l0]) {
                     gf->nodes[i]->src[0] = inp0;
