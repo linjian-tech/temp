@@ -287,6 +287,7 @@ struct server_slot {
         size_t stop_pos = std::string::npos;
 
         for (const std::string & word : params.antiprompt) {
+            std::cout<<"word : params.antiprompt: "<<word<<std::endl;
             size_t pos;
 
             if (type == STOP_TYPE_FULL) {
@@ -3375,7 +3376,7 @@ int main(int argc, char ** argv) {
             passing_data["token_id"] = 0;
             passing_data["slot_id"] = -1;
             passing_data["token"] = "";
-            passing_data["stop"] = result.stop;
+            passing_data["stop_"] = result.stop;
             std::string input = passing_data.dump();
 
             httplib::Client cli("http://127.0.0.1:8082"); // worknode ip address and port
