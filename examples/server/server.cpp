@@ -95,6 +95,8 @@ struct server_task_result {
     //linjian
     std::vector<float> ggml_tensor_data;
     bool incomplete = false;
+    std::string  token;
+    int task_id   = -1;
 };
 
 struct server_task_multi {
@@ -133,6 +135,8 @@ struct server_params {
 
     bool slots_endpoint   = true;
     bool metrics_endpoint = false;
+
+    std::unordered_map<std::string, std::string> host_info;
 };
 
 struct server_slot {
@@ -287,7 +291,6 @@ struct server_slot {
         size_t stop_pos = std::string::npos;
 
         for (const std::string & word : params.antiprompt) {
-            std::cout<<"word : params.antiprompt: "<<word<<std::endl;
             size_t pos;
 
             if (type == STOP_TYPE_FULL) {
@@ -420,9 +423,51 @@ struct server_queue {
             task.id = id++;
             LOG_VERBOSE("new task id", {{"new_id", task.id}});
         }
+        std::cout<<"Post: task.id: "<<task.id<<std::endl;
         queue_tasks.push_back(std::move(task));
         condition_tasks.notify_one();
         return task.id;
+    }
+
+    int queue_post(std::vector<server_task>& pending_queue_tasks, int size) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        int s_size = pending_queue_tasks.size();
+        if (size == -1){
+            size = pending_queue_tasks.size();
+        }
+        while (!pending_queue_tasks.empty() && size > 0) {
+            server_task task = pending_queue_tasks.front();
+            if (task.id == -1) {
+                task.id = id++;
+                LOG_VERBOSE("new task id", {{ "new_id", task.id }});
+            }
+            std::cout << "Post: task.id:: " << task.id << std::endl;
+            queue_tasks.push_back(std::move(task));
+            pending_queue_tasks.erase(pending_queue_tasks.begin());
+            --size;
+        }
+//        for (auto& task : pending_queue_tasks) {
+//            if (task.id == -1) {
+//                task.id = id++;
+//                LOG_VERBOSE("new task id", {{ "new_id", task.id }});
+//            }
+//            std::cout << "Post: task.id: " << task.id << std::endl;
+//            queue_tasks.push_back(std::move(task));
+//        }
+        condition_tasks.notify_one();
+        return s_size;
+    }
+
+    void pending_post(server_task task) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        queue_tasks.push_back(std::move(task));
+        return;
+    }
+
+    void clear_queue() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        queue_tasks.clear();
+        return;
     }
 
     // Add a new task, but defer until one slot is available
@@ -438,6 +483,13 @@ struct server_queue {
         LOG_VERBOSE("new task id", {{"new_id", new_id}});
         return new_id;
     }
+
+    void set_new_id(int new_id) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        id = new_id;
+        LOG_VERBOSE("new task id", {{"new_id", new_id}});
+    }
+
 
     // Register function to process a new task
     void on_new_task(std::function<void(server_task &)> callback) {
@@ -486,14 +538,6 @@ struct server_queue {
 
             while (true) {
                 std::unique_lock<std::mutex> lock(mutex_tasks);
-
-                if (!queue_tasks.empty()) {
-                    for (auto task: queue_tasks) {
-                        fprintf(stdout, "start loop tasks:: %ld\n", queue_tasks.size());
-                        std::cout << "task type:" << static_cast<int>(task.type) << std::endl;
-                    }
-                }
-
                 if (queue_tasks.empty()) {
                     lock.unlock();
                     break;
@@ -591,7 +635,7 @@ struct server_response {
     // when the request is finished, we can remove task associated with it
     void remove_waiting_task_id(int id_task) {
         LOG_VERBOSE("remove waiting for task id", {{"id_task", id_task}});
-
+        std::cout<<"[Dec] remove_waiting_task_id: "<<id_task<<std::endl;
         std::unique_lock<std::mutex> lock(mutex_results);
         waiting_task_ids.erase(id_task);
     }
@@ -605,6 +649,7 @@ struct server_response {
             });
 
             for (int i = 0; i < (int) queue_results.size(); i++) {
+                //std::cout<<"[Dec] queue_results[i].id"<< queue_results[i].id<<" and id task:"<< id_task<<std::endl;
                 if (queue_results[i].id == id_task) {
                     assert(queue_results[i].id_multi == -1);
                     server_task_result res = queue_results[i];
@@ -625,7 +670,7 @@ struct server_response {
     // Send a new result to a waiting id_task
     void send(server_task_result result) {
         LOG_VERBOSE("send new result", {{"id_task", result.id}});
-
+        std::cout<<"[Dec] send: result.id: "<< result.id<<std::endl;
         std::unique_lock<std::mutex> lock(mutex_results);
         for (const auto & id_task : waiting_task_ids) {
             // LOG_TEE("waiting task id %i \n", id_task);
@@ -635,7 +680,7 @@ struct server_response {
                 callback_update_multitask(id_task, result.id, result);
                 continue;
             }
-
+            std::cout<<"[Dec] send: result.id"<< result.id<< " id_task "<<id_task<< std::endl;
             if (result.id == id_task) {
                 LOG_VERBOSE("queue_results.push_back", {{"id_task", id_task}});
                 queue_results.push_back(result);
@@ -673,6 +718,7 @@ struct server_context {
     json default_generation_settings_for_props;
 
     server_queue    queue_tasks;
+    server_queue    pending_queue_tasks;
     server_response queue_results;
 
     server_metrics metrics;
@@ -680,6 +726,10 @@ struct server_context {
     std::vector<std::string> results_vector;
     bool stop = false;
     int task_id = -1;
+    bool slots_start = false;
+    std::vector<int> id_task_array;
+
+    std::unordered_map<std::string, std::string> host_list;
 
     ~server_context() {
         if (ctx) {
@@ -833,8 +883,7 @@ struct server_context {
     server_slot * get_corresponding_slot(int id) {
         server_slot * null_slot = nullptr;
         for (server_slot &slot: slots) {
-            //if (slot.id == id && slot.state == SLOT_STATE_PROCESSING && slot.command == SLOT_COMMAND_NONE) {
-            if (slot.id == id){
+            if (slot.id == id) {
                 return &slot;
             }
         }
@@ -844,7 +893,7 @@ struct server_context {
     bool launch_slot_with_data(server_slot & slot, json data) const {
         slot_params default_params;
         llama_sampling_params default_sparams;
-
+        std::cout<<"[Dec] start: launch_slot_with_data: slot id "<<slot.id<<std::endl;
         if (data.count("__oaicompat") != 0) {
             slot.oaicompat = true;
             slot.oaicompat_model = json_value(data, "model", std::string(DEFAULT_OAICOMPAT_MODEL));
@@ -1014,7 +1063,7 @@ struct server_context {
             slot.ctx_sampling = llama_sampling_init(slot.sparams);
             llama_set_rng_seed(ctx, slot.params.seed);
         }
-
+        std::cout<<"[Dec] end: launch_slot_with_data: slot id "<<slot.id<<std::endl;
         slot.command = SLOT_COMMAND_LOAD_PROMPT;
         slot.prompt_tokens.clear();
 
@@ -1195,7 +1244,6 @@ struct server_context {
             });
         }
 
-        std::cout<< "tok and eos:"<<result.tok<<"  "<<llama_token_eos(model)<<std::endl;
         if (result.tok == llama_token_eos(model)) {
             slot.stopped_eos    = true;
             slot.has_next_token = false;
@@ -1214,7 +1262,7 @@ struct server_context {
             {"stopped_limit",  slot.stopped_limit},
             {"stopping_word",  slot.stopping_word},
         });
-        std::cout<< "slot.has_next_token:"<<slot.has_next_token<< "token "<< token_str<<" content "<<result.text_to_send<<std::endl;
+
         return slot.has_next_token; // continue
     }
 
@@ -1416,8 +1464,8 @@ struct server_context {
         float* data = (float *)(slot.trans_tensor->data);
         std::vector<float> ve (data, data + ggml_nelements(slot.trans_tensor));
         res.ggml_tensor_data = ve;
-        res.incomplete = false;
         //res.ggml_tensor_data = (float *)(slot.trans_tensor->data);
+        res.incomplete = false;
         queue_results.send(res);
     }
 
@@ -1467,7 +1515,8 @@ struct server_context {
                 split_multiprompt_task(id_task, task);
             }
         } else {
-            queue_tasks.post(task);
+            pending_queue_tasks.pending_post(task);
+            //queue_tasks.post(task);
         }
     }
 
@@ -1510,6 +1559,7 @@ struct server_context {
             case SERVER_TASK_TYPE_COMPLETION:
             {
                 server_slot * slot = get_slot(json_value(task.data, "id_slot", -1));
+                std::cout<<"[Dec] SERVER_TASK_TYPE_COMPLETION: "<<slot->id<<std::endl;
                 if (slot == nullptr) {
                     // if no slot is available, we defer this task for processing later
                     LOG_VERBOSE("no slot is available", {{"id_task", task.id}});
@@ -1558,9 +1608,7 @@ struct server_context {
             } break;
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
             {
-                server_slot * slot = get_corresponding_slot(task.slot_id);
-                slot->sampled = task.token_id;
-                slot->ggml_tensor_data = task.ggml_tensor_data;
+
             } break;
             case SERVER_TASK_TYPE_METRICS:
             {
@@ -1711,16 +1759,22 @@ struct server_context {
                 return true;
             }
         }
-        // if there are multiple node, then we need comment the following code block
-//        if(e_layer-s_layer+1==n_layer)
-//        {
-//            LOG_VERBOSE("posting NEXT_RESPONSE", {});
-//
-//            server_task task;
-//            task.type      = SERVER_TASK_TYPE_NEXT_RESPONSE;
-//            task.id_target = -1;
-//
-//            queue_tasks.post(task);
+
+//        if (host_list.size() == 1) {
+//            if(e_layer-s_layer+1==n_layer)
+//            {
+        {
+            LOG_VERBOSE("posting NEXT_RESPONSE", {});
+
+            server_task task;
+            task.type = SERVER_TASK_TYPE_NEXT_RESPONSE;
+            task.id_target = -1;
+
+            pending_queue_tasks.pending_post(task);
+            std::cout<<"[Dec] pending_queue_tasks.pending_post(task)"<<std::endl;
+        }
+//                queue_tasks.post(task);
+//            }
 //        }
 
         // apply context-shift if needed
@@ -1768,10 +1822,11 @@ struct server_context {
 
         // first, add sampled tokens from any ongoing sequences (decode any currently ongoing sequences)
         for (auto & slot : slots) {
+            std::cout<<"[Dec] slot id task "<<slot.id_task<<std::endl;
             if (slot.state == SLOT_STATE_IDLE) {
                 continue;
             }
-
+            std::cout<<"[Dec] slot id task double check"<<slot.id_task<<std::endl;
             slot.i_batch = batch.n_tokens;
 
             const int32_t slot_npast = slot.n_past_se > 0 ? slot.n_past_se : slot.n_past;
@@ -1779,7 +1834,7 @@ struct server_context {
             // TODO: we always have to take into account the "system_tokens"
             //       this is not great and needs to be improved somehow
             llama_batch_add(batch, slot.sampled, system_tokens.size() + slot_npast, { slot.id + 1 }, true);
-
+            std::cout<<"[single node] slot.sampled: "<< slot.sampled<< " system_tokens.size() + slot_npast "<< system_tokens.size() + slot_npast<<" slot.id "<<slot.id <<" (int32_t) batch.n_tokens "<<batch.n_tokens<<std::endl;
             slot.n_past += 1;
 
             if (slot.params.cache_prompt) {
@@ -1801,10 +1856,11 @@ struct server_context {
         int32_t n_batch = params.n_batch;
 
         // next, batch any pending prompts without exceeding n_batch
+        std::cout<<"[Dec] params.cont_batching : "<<params.cont_batching<<std::endl;
         if (params.cont_batching || batch.n_tokens == 0) {
             for (auto & slot : slots) {
                 const bool has_prompt = slot.prompt.is_array() || (slot.prompt.is_string() && !slot.prompt.get<std::string>().empty());
-
+                std::cout<<"[Dec] params.cont_batching || batch.n_tokens == 0: "<<slot.id<<std::endl;
                 // empty prompt passed -> release the slot and send empty response
                 // note: infill mode allows empty prompt
                 if (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT && !has_prompt && !slot.infill) {
@@ -1815,11 +1871,11 @@ struct server_context {
                     send_final_response(slot);
                     continue;
                 }
-
+                std::cout<<"[Dec] slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT: "<<slot.state<<" "<<slot.command<<std::endl;
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT) {
                     auto & prompt_tokens = slot.prompt_tokens;
-
+                    std::cout<<"[Dec] slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT"<<slot.id<<std::endl;
                     // we haven't tokenized the prompt yet - do it now:
                     if (prompt_tokens.empty()) {
                         LOG_VERBOSE("tokenizing prompt", {
@@ -2009,7 +2065,7 @@ struct server_context {
                         {"n_tokens", batch.n_tokens},
                         {"progress", (float) slot.n_prompt_tokens_processed / slot.n_prompt_tokens},
                     });
-
+                    std::cout<<"[Dec] {slot.npast, slot.n_prompt_tokens}: "<<slot.n_past<< " , "<<slot.n_prompt_tokens<<std::endl;
                     // entire prompt has been processed - start decoding new tokens
                     if (slot.n_past == slot.n_prompt_tokens) {
                         slot.state   = SLOT_STATE_PROCESSING;
@@ -2794,6 +2850,25 @@ static void server_params_parse(int argc, char ** argv, server_params & sparams,
                 break;
             }
             params.kv_overrides.push_back(kvo);
+        } else if (arg == "--hostfile") {
+            if (++i >= argc) {
+                invalid_param = true;
+                break;
+            }
+            std::ifstream host_file(argv[i]);
+            if (!host_file) {
+                fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
+                invalid_param = true;
+                break;
+            }
+            std::string hostinfo;
+            while (std::getline(host_file, hostinfo)) {
+                if (!hostinfo.empty() && hostinfo[0] != '#') {
+                    int found = hostinfo.find(' ');
+                    sparams.host_info[hostinfo.substr(0, found)] = hostinfo.substr(found + 1);
+                }
+            }
+            host_file.close();
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             server_print_usage(argv[0], default_params, default_sparams);
@@ -3132,6 +3207,7 @@ int main(int argc, char ** argv) {
         return 1;
     } else {
         ctx_server.initialize();
+        ctx_server.host_list = sparams.host_info;
         state.store(SERVER_STATE_READY);
     }
 
@@ -3313,85 +3389,103 @@ int main(int argc, char ** argv) {
      *     ggml_tensor->data = (void*)(vecPtr);
      */
 
-    const auto handle_worknode_initialize = [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_worknode_initialize = [&ctx_server, &validate_api_key, &sparams](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
         if (!validate_api_key(req, res)) {
             return;
         }
+        std::cout<<"[Dec] handle_worknode_initialize"<<std::endl;
+
+
         json data = json::parse(req.body);
 
-        const int id_task = ctx_server.queue_tasks.get_new_id();
+        int id_task = json_value(data, "task_id", -1);
+        if(id_task == -1) {
+            id_task = ctx_server.queue_tasks.get_new_id();
+        }else {
+            ctx_server.queue_tasks.set_new_id(id_task);
+        }
 
+//        const int id_task = ctx_server.queue_tasks.get_new_id();
+//        ctx_server.id_task_array.push_back(id_task);
         ctx_server.queue_results.add_waiting_task_id(id_task);
-        ctx_server.task_id = id_task;
+        //ctx_server.task_id = id_task;
         ctx_server.request_completion(id_task, -1, data, false, false);
 
         if (data["e_layer"] == 31){
-            if (!json_value(data, "stream", false)) {
-                server_task_result result = ctx_server.queue_results.recv(id_task);
-                if (!result.error && result.stop) {
-                    res.set_content(result.data.dump(-1, ' ', false, json::error_handler_t::replace), "application/json; charset=utf-8");
-                }
+            //...
+//            if (!json_value(data, "stream", false)) {
+//                server_task_result result = ctx_server.queue_results.recv(id_task);
+//                if (!result.error && result.stop) {
+//                    res.set_content(result.data.dump(-1, ' ', false, json::error_handler_t::replace), "application/json; charset=utf-8");
+//                }
+//
+//                ctx_server.queue_results.remove_waiting_task_id(id_task);
+//            } else {
+//                server_task_result result = ctx_server.queue_results.recv(id_task);
+//                if (!result.error) {
+            //...
+//                    const std::string str =
+//                            "data: " +
+//                            result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
+//                            "\n\n";
+//
+//                    LOG_VERBOSE("data stream", {
+//                        { "to_send", str }
+//                    });
 
-                ctx_server.queue_results.remove_waiting_task_id(id_task);
-            } else {
-                server_task_result result = ctx_server.queue_results.recv(id_task);
-                if (!result.error) {
-                    const std::string str =
-                            "data: " +
-                            result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
-                            "\n\n";
+            std::vector<float> vector_data;//null
+            json result_data;
+            //result_data["slot_id"] = result.data["id_slot"];
+            //result_data["token_id"] = result.data["token_id"];
+            result_data["slot_id"] = -1;
+            result_data["token_id"] = 0;
+            result_data["ggml_tensor_data"] = vector_data;
+            //result_data["data"] = result.data;
+            result_data["s_layer"] = 0;
+            result_data["e_layer"] = 15;
+            result_data["stop"] = false;
+            result_data["task_id"] = id_task;
+            //result_data["incomplete"] = result.incomplete;
+            json jsonArray = json::array();
+            jsonArray.push_back(result_data);
+            std::string input = jsonArray.dump();
 
-                    LOG_VERBOSE("data stream", {
-                        { "to_send", str }
-                    });
-
-                    std::vector<float> vector_data;//null
-                    json result_data;
-                    result_data["slot_id"] = result.data["id_slot"];
-                    int a = result.data["id_slot"];
-                    int b = result.data["token_id"];
-                    result_data["token_id"] = result.data["token_id"];
-                    result_data["ggml_tensor_data"] = vector_data;
-                    result_data["token"] = str;
-                    result_data["s_layer"] = 0;
-                    result_data["e_layer"] = 15;
-                    result_data["stop"] = result.stop;
-                    result_data["incomplete"] = result.incomplete;
-                    std::string input = result_data.dump();
-
-                    httplib::Client cli("http://127.0.0.1:8080");
-                    auto forwarded_res = cli.Post("/masternode_passing", input, "application/json");
-                }
-                res.set_content("passing success!","text/plain");
+            if (ctx_server.queue_results.waiting_task_ids.size()==1) {
+                httplib::Client cli(sparams.host_info["worker1"]);
+                auto forwarded_res = cli.Post("/worknode_notify", input, "application/json");
             }
+//                }
+//                res.set_content("passing success!","text/plain");
+//            }
         }else {
-            server_task_result result = ctx_server.queue_results.recv(id_task);
-            std::vector<float> vector_data = result.ggml_tensor_data;
+            //server_task_result result = ctx_server.queue_results.recv(id_task);
+            //std::vector<float> vector_data = result.ggml_tensor_data;
 
             json passing_data = json::parse(req.body);
             passing_data["s_layer"] = 15;
             passing_data["e_layer"] = 31;
-            passing_data["ggml_tensor_data"] = vector_data;
-            passing_data["token_id"] = 0;
-            passing_data["slot_id"] = -1;
-            passing_data["token"] = "";
-            passing_data["stop_"] = result.stop;
+            passing_data["task_id"] = id_task;
+            //passing_data["ggml_tensor_data"] = vector_data;
+            //passing_data["token_id"] = 0;
+            //passing_data["slot_id"] = -1;
+            //passing_data["token"] = "";
+            //passing_data["stop"] = result.stop;
             std::string input = passing_data.dump();
 
-            httplib::Client cli("http://127.0.0.1:8082"); // worknode ip address and port
+            httplib::Client cli(sparams.host_info["worker2"]); // worknode ip address and port
             auto forwarded_res = cli.Post("/worknode_initialize", input, "application/json; charset=utf-8");
         }
 
     };
 
     // linjian : add masternode schedule
-    const auto handle_completions = [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_completions = [&ctx_server, &validate_api_key, &sparams](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
         if (!validate_api_key(req, res)) {
             return;
         }
-        std::cout<<"req.body: "<<req.body<<std::endl;
+        std::cout<<"[Dec] hanlde:completions: req body"<<req.body<<std::endl;
         std::vector<float> vector_data;
         json data = json::parse(req.body);
         data["s_layer"] = 0;
@@ -3404,176 +3498,383 @@ int main(int argc, char ** argv) {
         std::string input = data.dump();
 
         // pass post request.body to worknode 1, and add some new inforation into input
-        httplib::Client cli("http://127.0.0.1:8081"); // worknode1 ip address and port
+        httplib::Client cli(sparams.host_info["worker1"]); // worknode1 ip address and port
         auto forwarded_res = cli.Post("/worknode_initialize", input, "application/json");
+        //...
 
-        const auto chunked_content_provider = [&ctx_server](size_t, httplib::DataSink & sink) {
+        ctx_server.task_id++;
+        int id_task = ctx_server.task_id;
+        ctx_server.queue_results.add_waiting_task_id(id_task);
+        const auto chunked_content_provider = [id_task, &ctx_server](size_t, httplib::DataSink & sink) {
             while (true) {
-                std::string str = "";
-                //blocking until receive new result
-                while(true) {
-                    if(!ctx_server.results_vector.empty()) {
-                        str = ctx_server.results_vector[0];
-                        ctx_server.results_vector.erase(ctx_server.results_vector.begin());
-                        std::cout<<int(ctx_server.results_vector.size());
+                server_task_result result = ctx_server.queue_results.recv(id_task);
+                if (!result.error) {
+
+//                    const std::string str =
+//                            "data: " +
+//                            result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
+//                            "\n\n";
+                    const std::string str = result.token;
+
+                    LOG_VERBOSE("data stream", {
+                        { "to_send", str }
+                    });
+                    std::cout<<"[Dec] handle completion: "<<str<<std::endl;
+                    if (!sink.write(str.c_str(), str.size())) {
+                        ctx_server.queue_results.remove_waiting_task_id(id_task);
+                        return false;
+                    }
+
+                    if (result.stop) {
                         break;
                     }
-                }
-                if(str != "") {
-                    sink.write(str.c_str(), str.size());
-                }
-                if(ctx_server.stop){
+                } else {
+                    const std::string str =
+                            "error: " +
+                            result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
+                            "\n\n";
+
+                    LOG_VERBOSE("data stream", {
+                        { "to_send", str }
+                    });
+
+                    if (!sink.write(str.c_str(), str.size())) {
+                        ctx_server.queue_results.remove_waiting_task_id(id_task);
+                        return false;
+                    }
+
                     break;
                 }
             }
+
+            ctx_server.queue_results.remove_waiting_task_id(id_task);
             sink.done();
+
             return true;
         };
+
+
+//        const auto chunked_content_provider = [&ctx_server](size_t, httplib::DataSink & sink) {
+//            while (true) {
+//                std::string str = "";
+//                //blocking until receive new result
+//                while(true) {
+//                    if(!ctx_server.results_vector.empty()) {
+//                        str = ctx_server.results_vector[0];
+//                        ctx_server.results_vector.erase(ctx_server.results_vector.begin());
+//                        std::cout<<int(ctx_server.results_vector.size());
+//                        break;
+//                    }
+//                }
+//                if(str != "") {
+//                    sink.write(str.c_str(), str.size());
+//                }
+//                if(ctx_server.stop){
+//                    break;
+//                }
+//            }
+//            sink.done();
+//            return true;
+//        };
         res.set_chunked_content_provider("text/event-stream", chunked_content_provider);
     };
 
 
     // receive the token of final worknode, the store result to masternode outputstream and pass new content to first worknode
-    const auto handle_masternode_passing= [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_masternode_passing= [&ctx_server, &validate_api_key, &sparams](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
         if (!validate_api_key(req, res)) {
             return;
         }
-        json data_input = json::parse(req.body);
-        if (!data_input["incomplete"]) {
-            ctx_server.stop = data_input["stop"];
-            std::string token = data_input["token"];
-            std::cout << "Dec: handle_masternode_passing: token" << token << " stop: " << ctx_server.stop << std::endl;
-            ctx_server.results_vector.push_back(token); //store result token
+        std::cout<<"[Dec] handle_masternode_passing"<<std::endl;
+        bool stop = true;
+        json data = json::parse(req.body);
+        int i = 0;
+        for (auto& data_input : data) {
+            if (!data_input["incomplete"]) {
+                server_task_result result;
+                result.stop = data_input["stop"];
+//            result.data = data_input["data"];
+                result.token = data_input["token"];
+                result.error = false;
+//                result.id = ctx_server.task_id;
+                result.id = i;
+                i++;
+
+                const std::string str = data_input["token"];
+//            const std::string str =
+//                    "data: " +
+//                    result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
+//                    "\n\n";
+                std::cout << "[Dec] function: handle_masternode_passing: result.data:" << str << std::endl;
+                //ctx_server.stop = data_input["stop"];
+                //std::string token = data_input["token"];
+                //ctx_server.results_vector.push_back(token); //store result token
+                ctx_server.queue_results.send(result);
+            }
+            if (data_input["stop"]) {
+                json input_json;
+                input_json = {
+                        {"e_layer", 15},
+                        {"task_id", data_input["task_id"]}
+
+                };
+                std::string input = input_json.dump();
+                httplib::Client cli(sparams.host_info["worker1"]);
+                auto forwarded_res = cli.Post("/worknode_release_slot", input, "application/json; charset=utf-8");
+            }else{
+                stop = false;
+            }
         }
-        if(!data_input["stop"]) {
-            httplib::Client cli("http://127.0.0.1:8081");
+
+        if(!stop){
+            httplib::Client cli(sparams.host_info["worker1"]);
             auto forwarded_res = cli.Post("/worknode_notify", req.body, "application/json");
-        }else{
-            json input_json;
-            input_json = {
-                    {"e_layer",          15}
-
-            };
-            std::string input = input_json.dump();
-            httplib::Client cli("http://127.0.0.1:8081");
-            auto forwarded_res = cli.Post("/worknode_release_slot", input, "application/json; charset=utf-8");
         }
 
-        res.set_content("passing success!","text/plain");
     };
 
-    const auto handle_worknode_notify= [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_worknode_notify= [&ctx_server, &validate_api_key, &sparams](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
         if (!validate_api_key(req, res)) {
             return;
         }
-        json data_input = json::parse(req.body);
-        int id_task = ctx_server.task_id;
-        {
-            LOG_VERBOSE("posting NEXT_RESPONSE", {});
-
-            server_task task;
-            task.type = SERVER_TASK_TYPE_NEXT_RESPONSE;
-            task.id_target = -1;
-            // put new token id and correnspond id_slot
-            task.slot_id = 0;
-            task.token_id = data_input["token_id"];
-            std::vector<float> vector_data = data_input["ggml_tensor_data"];
-            task.ggml_tensor_data = vector_data; //vector_data.data();
-
-            ctx_server.queue_tasks.post(task);
+        std::cout<<"[Dec] handle_worknode_notify"<<std::endl;
+        int e_layer = -1;
+        int s_layer = -1;
+        json data = json::parse(req.body);
+        json jsonArray = json::array();
+//        for (auto &id_task: ctx_server.id_task_array){
+//            int slot_id = -1;
+//            for (auto& slot : ctx_server.slots) {
+//                if (slot.id_task == id_task) {
+//                    slot_id = slot.id;
+//                    break;
+//                }
+//            }
+//
+//        }
+        // set middle variable to new node
+        int i = 0;
+        int size = -1;
+        for(auto& data_input : data) {
+            s_layer = data_input["s_layer"];
+            size = (json_value(data_input, "size", -1));
+            std::cout<<"[Dec] round: "<<i<<std::endl;
+            i++;
+//            bool find_slot = false;
+            int slot_id = -1;
+            for (auto &slot: ctx_server.slots) {
+                if (slot.id_task == data_input["task_id"]) {
+                    //slot_id = slot.id;
+                    std::cout<<"[Dec] slot.id_task:"<<slot.id_task<<std::endl;
+                    slot.sampled = data_input["token_id"];
+                    std::vector<float> vector_data = data_input["ggml_tensor_data"];
+                    slot.ggml_tensor_data = vector_data;
+//                    find_slot = true;
+                    break;
+                }
+            }
+//            if (!find_slot){
+//                std::vector<float> vector_data = data_input["ggml_tensor_data"];
+//                temp_vector_data = vector_data;
+//            }
         }
+        // notify new task
+//        std::set<int> wait_tasks_id;
+        int wait_task_id = -1;
+        for (auto& task: ctx_server.pending_queue_tasks.queue_tasks){
+            if (task.type == SERVER_TASK_TYPE_COMPLETION){
+//                wait_tasks_id.insert(task.id);
+                wait_task_id = task.id;
+                std::cout<<"[Dec] task.id: "<<task.id<<std::endl;
+                for(auto& data_input : data){
+                    if (data_input["slot_id"] == -1){
+                        std::vector<float> vector_data = data_input["ggml_tensor_data"];
+                        task.ggml_tensor_data = vector_data;
+                        break;
+                    }
+                }
 
-        if (data_input["e_layer"] == 31) {
-            server_task_result result = ctx_server.queue_results.recv(id_task);
+                //vector_data.data();
+            }
+        }
+        std::cout<<"[Dec] ctx_server.queue_tasks.queue_tasks size: "<<ctx_server.queue_tasks.queue_tasks.size()<<std::endl;
+        std::cout<<"[Dec] ctx_server.pending_queue_tasks.queue_tasks size: "<<ctx_server.pending_queue_tasks.queue_tasks.size()<<std::endl;
 
-            if (!result.error) {
-                const std::string str =
-                        "data: " +
-                        result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
-                        "\n\n";
 
-                LOG_VERBOSE("data stream", {
-                    { "to_send", str }
-                });
+        size = ctx_server.queue_tasks.queue_post(ctx_server.pending_queue_tasks.queue_tasks, size);
 
-                std::vector<float> vector_data;//null
+        std::cout<<"[Dec] ctx_server.pending_queue_tasks.queue_tasks size: "<<ctx_server.pending_queue_tasks.queue_tasks.size()<<std::endl;
+//        ctx_server.pending_queue_tasks.clear_queue();
 
-                json result_data;
+//        while (!ctx_server.pending_queue_tasks.queue_tasks.empty()) {
+//            server_task task = ctx_server.pending_queue_tasks.queue_tasks.front();
+//            ctx_server.pending_queue_tasks.queue_tasks.erase(
+//                    ctx_server.pending_queue_tasks.queue_tasks.begin());
+////                    if (task.type == SERVER_TASK_TYPE_NEXT_RESPONSE) {
+////                        task.slot_id = slot_id;
+////                        task.token_id = data_input["token_id"];
+////                        std::vector<float> vector_data = data_input["ggml_tensor_data"];
+////                        task.ggml_tensor_data = vector_data; //vector_data.data();
+////                    } else {
+////            if (task.type == SERVER_TASK_TYPE_COMPLETION){
+////                for(auto& data_input : data){
+////                    if (data_input["slot_id"] == -1){
+////                        std::vector<float> vector_data = data_input["ggml_tensor_data"];
+////                        task.ggml_tensor_data = vector_data;
+////                        break;
+////                    }
+////                }
+////                //vector_data.data();
+////            }
+////                    std::cout << "post_queue: task info: type: " << task.type << std::endl;
+//
+//            ctx_server.pending_queue_tasks.queue_tasks.erase(
+//                    ctx_server.pending_queue_tasks.queue_tasks.begin());
+//
+//            //ctx_server.queue_tasks.post(task);
+//        }
+        std::cout << "move task successful!" << std::endl;
 
-                result_data["slot_id"] = result.data["id_slot"];
-                result_data["token_id"] = result.data["token_id"];
-                result_data["ggml_tensor_data"] = vector_data;
-                result_data["token"] = str;
-                result_data["s_layer"] = 0;
-                result_data["e_layer"] = 15;
-                result_data["stop"] = result.stop;
-                result_data["incomplete"] = result.incomplete;
-                std::string input = result_data.dump();
-                httplib::Client cli("http://127.0.0.1:8080");
 
-                auto forwarded_res = cli.Post("/masternode_passing", input, "application/json; charset=utf-8");
+        // recv result error
+//        std::set<int> wait_tasks_id = ctx_server.queue_results.waiting_task_ids;
+        for(auto& data_input : data) {
+            if (data_input["e_layer"] == 31) {
+                e_layer = data_input["e_layer"];
+                server_task_result result = ctx_server.queue_results.recv(data_input["task_id"]);
+                if (!result.error) {
+                    const std::string str =
+                            "data: " +
+                            result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
+                            "\n\n";
+
+                    LOG_VERBOSE("data stream", {
+                        { "to_send", str }
+                    });
+
+                    std::vector<float> vector_data;//null
+
+                    json result_data;
+                    std::cout << "[Dec] 0" << std::endl;
+                    result_data["slot_id"] = result.data["id_slot"];
+                    std::cout << "[Dec] 1" << std::endl;
+                    result_data["token_id"] = result.data["token_id"];
+                    result_data["task_id"] = result.id;
+                    std::cout << "[Dec] 2" << std::endl;
+                    result_data["ggml_tensor_data"] = vector_data;
+                    //result_data["data"] = result.data;
+                    result_data["token"] = str;
+                    std::cout << "[Dec] 3" << std::endl;
+                    result_data["s_layer"] = 0;
+                    result_data["e_layer"] = 15;
+                    result_data["stop"] = result.stop;
+                    result_data["incomplete"] = result.incomplete;
+
+                    jsonArray.push_back(result_data);
+                }
+//                    std::string input = result_data.dump();
+//                    std::cout << "[Dec] 4" << std::endl;
+//                    httplib::Client cli(sparams.host_info["master"]);
+//                    auto forwarded_res = cli.Post("/masternode_passing", input, "application/json; charset=utf-8");
+//                    res.set_content("start worknode success!", "text/plain");
+            } else {
+                server_task_result result = ctx_server.queue_results.recv(data_input["task_id"]);
+                std::vector<float> vector_data = result.ggml_tensor_data;
+                json input_json;
+
+                input_json = {
+                        {"ggml_tensor_data", vector_data},
+                        {"token_id",         data_input["token_id"]},
+                        {"slot_id",          data_input["slot_id"]},
+                        {"task_id",          result.id},
+                        {"s_layer",          15},
+                        {"e_layer",          31},
+                        {"stop",             data_input["stop"]},
+                        {"size",              size}
+                };
+                jsonArray.push_back(input_json);
+//                std::string input = input_json.dump();
+//
+//                httplib::Client cli(sparams.host_info["worker2"]); // worknode ip address and port
+//                auto forwarded_res = cli.Post("/worknode_notify", input, "application/json; charset=utf-8");
 
             }
-            res.set_content("start worknode success!", "text/plain");
-        } else {
-            server_task_result result = ctx_server.queue_results.recv(id_task);
+        }
+        if (ctx_server.queue_results.queue_results.size() > 0){
+            std::cout<<"[Dec] ctx_server.queue_results.queue_results.size():"<<ctx_server.queue_results.queue_results.size()<<std::endl;
+            server_task_result result = ctx_server.queue_results.recv(wait_task_id);
             std::vector<float> vector_data = result.ggml_tensor_data;
             json input_json;
 
             input_json = {
                     {"ggml_tensor_data", vector_data},
-                    {"token_id",         data_input["token_id"]},
-                    {"slot_id",          data_input["slot_id"]},
+                    {"token_id",         0},
+                    {"slot_id",          -1},
+                    {"task_id",          result.id},
                     {"s_layer",          15},
                     {"e_layer",          31},
-                    {"stop",             data_input["stop"]},
+                    {"stop",             false},
             };
-
-            std::string input = input_json.dump();
-
-            httplib::Client cli("http://127.0.0.1:8082"); // worknode ip address and port
+            jsonArray.push_back(input_json);
+        }
+        std::string input = jsonArray.dump();
+        if (e_layer == 31){
+            std::cout << "[Dec] 4" << std::endl;
+            httplib::Client cli(sparams.host_info["master"]);
+            auto forwarded_res = cli.Post("/masternode_passing", input, "application/json; charset=utf-8");
+        }else{
+            httplib::Client cli(sparams.host_info["worker2"]); // worknode ip address and port
             auto forwarded_res = cli.Post("/worknode_notify", input, "application/json; charset=utf-8");
         }
     };
 
-
-    const auto handle_worknode_release_slot = [&ctx_server, &validate_api_key](const httplib::Request & req, httplib::Response & res) {
+    const auto handle_worknode_release_slot = [&ctx_server, &validate_api_key, &sparams](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
         if (!validate_api_key(req, res)) {
             return;
         }
-        int id_task = ctx_server.task_id;
+        std::cout<<"[Dec] handle_release_slot"<<std::endl;
+        json data_input = json::parse(req.body);
+        while(!ctx_server.pending_queue_tasks.queue_tasks.empty()) {
+            std::cout << "clear queue" << std::endl;
+            ctx_server.pending_queue_tasks.queue_tasks.erase(ctx_server.pending_queue_tasks.queue_tasks.begin());
+
+        }
+
+        int id_task = data_input["task_id"];
 
         ctx_server.request_cancel(id_task);
         ctx_server.queue_results.remove_waiting_task_id(id_task);
-        ctx_server.stop = false;
-        json data_input = json::parse(req.body);
+        //ctx_server.stop = false;
+
         if (data_input["e_layer"] != 31) {
             json input_json;
             input_json = {
-                    {"e_layer",          31}
+                    {"e_layer",          31},
+                    {"task_id",          id_task}
 
             };
             std::string input = input_json.dump();
-            httplib::Client cli("http://127.0.0.1:8082"); // worknode ip address and port
+            httplib::Client cli(sparams.host_info["worker2"]); // worknode ip address and port
             auto forwarded_res = cli.Post("/worknode_release_slot", input, "application/json; charset=utf-8");
         }
     };
 
-    // worknode post processing functions
-    svr.Post("/worknode_initialize",        handle_worknode_initialize);
-    svr.Post("/worknode_notify",            handle_worknode_notify);
-    svr.Post("/worknode_release_slot",      handle_worknode_release_slot);
-
-    // masternode post processing functions
-    svr.Post("/masternode_passing",         handle_masternode_passing);
     // if you want to start llama cpp by multiple node
-    svr.Post("/completion",                 handle_completions);
-
-    // if you want to start llama cpp by single node
-    //svr.Post("/completion", completions);
+    if (sparams.host_info.size() > 1) {
+        svr.Post("/completion",             handle_completions);
+        // worknode post-processing functions
+        svr.Post("/worknode_initialize",        handle_worknode_initialize);
+        svr.Post("/worknode_notify",            handle_worknode_notify);
+        svr.Post("/worknode_release_slot",      handle_worknode_release_slot);
+        // masternode post-processing functions
+        svr.Post("/masternode_passing",         handle_masternode_passing);
+    } else {
+        // if you want to start llama cpp by single node
+        svr.Post("/completion",             completions);
+    }
 
     svr.Get("/v1/models", [&params, &model_meta](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
