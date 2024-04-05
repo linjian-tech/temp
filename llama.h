@@ -418,6 +418,9 @@ LLAMA_API int32_t llama_model_desc(const struct llama_model * model, char * buf,
 // Returns the total size of all the tensors in the model in bytes
 LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+// Returns the number of model layers
+LLAMA_API uint64_t llama_model_layers(const struct llama_model * model);
+
 // Returns the total number of parameters in the model
 LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
 

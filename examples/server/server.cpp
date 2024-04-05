@@ -33,6 +33,12 @@ using json = nlohmann::json;
 bool server_verbose = false;
 bool server_log_json = true;
 
+enum pipeline_divide_type {
+    PIPELINE_DIVIDE_TYPE_SIZE,
+    PIPELINE_DIVIDE_TYPE_MEM,
+    PIPELINE_DIVIDE_TYPE_CPU
+};
+
 enum stop_type {
     STOP_TYPE_FULL,
     STOP_TYPE_PARTIAL,
@@ -728,7 +734,9 @@ struct server_context {
     int task_id = -1;
     bool slots_start = false;
     std::vector<int> id_task_array;
-
+    std::tuple<std::string, int, int> current_layers;
+    std::tuple<std::string, int, int> next_layers;
+    bool final_node = false;
     std::unordered_map<std::string, std::string> host_list;
 
     ~server_context() {
@@ -742,6 +750,73 @@ struct server_context {
             model = nullptr;
         }
     }
+
+    // support applying nodes size to make nodes loading strategy
+    std::vector<std::tuple<std::string, int, int>> set_nodes_layers_by_size(int n_layers, std::unordered_map<std::string, std::string> URLs) {
+        int nodes_size = (URLs.size() - 1);
+        std::vector<std::tuple<std::string, int, int>> nodes_layers;
+        const int n_per_node = (n_layers + (nodes_size - 1)) / nodes_size;
+        int start_index = 0;
+        int end_index = n_layers - 1;
+
+        int i = 0;
+        for (auto URL: URLs){
+            if (URL.first == "master") {
+                continue;
+            }
+            start_index = i * n_per_node;
+            end_index = std::min(n_layers -1, (i+1) * n_per_node);
+            std::cout<<"[Dec] devision results: start_index: "<<start_index<<" end_index "<<end_index<<std::endl;
+            std::tuple<std::string, int, int> node_info = std::make_tuple(URL.second, start_index, end_index);
+            nodes_layers.push_back(node_info);
+            i++;
+        }
+        nodes_layers.push_back(std::make_tuple(URLs["master"], -1, -1));
+        return nodes_layers;
+    }
+
+    // support applying nodes resource to make nodes loading strategy
+    std::vector<std::tuple<int, int>> set_nodes_layers_by_resource(int n_layers, std::vector<float> size_array) {
+        int total_size = 0;
+        int nodes_size = size_array.size();
+        for(auto& size : size_array){
+            total_size += size;
+        }
+        std::vector<std::tuple<int, int>> nodes_layers;
+        const int n_per_node = (n_layers) / total_size;
+
+        int l0 = 0;
+        int l1 = n_layers - 1;
+        for (int i = 0 ; i < nodes_size; i++){
+            int node_layer = int(n_per_node * size_array[i]);
+            l1 = std::min(n_layers -1, l0 + node_layer);
+            nodes_layers.push_back(std::make_tuple(l0, l1));
+            l0 = l1;
+        }
+        return nodes_layers;
+    }
+
+    std::vector<std::tuple<std::string, int, int>> pipeline_model_division(pipeline_divide_type type) {
+        int n_layers = llama_model_layers(model);
+        int nodes_size = host_list.size();
+        std::vector<std::tuple<std::string, int, int>> nodes_layers;
+        switch (type) {
+            case PIPELINE_DIVIDE_TYPE_SIZE: {
+                nodes_layers = set_nodes_layers_by_size(n_layers,host_list);
+            }
+                break;
+            case PIPELINE_DIVIDE_TYPE_MEM: {
+
+            }
+                break;
+            case PIPELINE_DIVIDE_TYPE_CPU: {
+
+            }
+                break;
+        };
+        return nodes_layers;
+    }
+
 
     bool load_model(const gpt_params & params_) {
         params = params_;
@@ -1856,7 +1931,6 @@ struct server_context {
         int32_t n_batch = params.n_batch;
 
         // next, batch any pending prompts without exceeding n_batch
-        std::cout<<"[Dec] params.cont_batching : "<<params.cont_batching<<std::endl;
         if (params.cont_batching || batch.n_tokens == 0) {
             for (auto & slot : slots) {
                 const bool has_prompt = slot.prompt.is_array() || (slot.prompt.is_string() && !slot.prompt.get<std::string>().empty());
@@ -3290,18 +3364,9 @@ int main(int argc, char ** argv) {
         if (!validate_api_key(req, res)) {
             return;
         }
-        //linjian: is the error due to a forward request
-//        std::string str1 = "{\"api_key\":\"\",\"cache_prompt\":true,\"e_layer\":15,\"frequency_penalty\":0,\"ggml_tensor_data\":[],\"grammar\":\"\",\"image_data\":[],\"min_p\":0.05,\"mirostat\":0,\"mirostat_eta\":0.1,\"mirostat_tau\":5,\"n_predict\":400,\"n_probs\":0,\"presence_penalty\":0,\"prompt\":\"undefined: hello\",\"repeat_last_n\":256,\"repeat_penalty\":1.18,\"s_layer\":0,\"slot_id\":-1,\"stop\":[\"</s>\",\"Llama:\",\"User:\"],\"stream\":true,\"temperature\":0.7,\"tfs_z\":1,\"token\":\"\",\"token_id\":0,\"top_k\":40,\"top_p\":0.95,\"typical_p\":1}";
-//        std::string str2 = "{\"stream\":true,\"n_predict\":400,\"temperature\":0.7,\"stop\":[\"</s>\",\"Llama:\",\"User:\"],\"repeat_last_n\":256,\"repeat_penalty\":1.18,\"top_k\":40,\"top_p\":0.95,\"min_p\":0.05,\"tfs_z\":1,\"typical_p\":1,\"presence_penalty\":0,\"frequency_penalty\":0,\"mirostat\":0,\"mirostat_tau\":5,\"mirostat_eta\":0.1,\"grammar\":\"\",\"n_probs\":0,\"image_data\":[],\"cache_prompt\":true,\"api_key\":\"\",\"slot_id\":-1,\"prompt\":\"undefined: hello\"}";
-//        if (str2 == req.body){
-//            std::cout<<"true"<<std::endl;
-//        } else{
-//            std::cout<<"false"<<std::endl;
-//        }
+
         json data = json::parse(req.body);
-
         const int id_task = ctx_server.queue_tasks.get_new_id();
-
         ctx_server.queue_results.add_waiting_task_id(id_task);
         ctx_server.request_completion(id_task, -1, data, false, false);
 
@@ -3389,91 +3454,70 @@ int main(int argc, char ** argv) {
      *     ggml_tensor->data = (void*)(vecPtr);
      */
 
+    const auto handle_worknode_register = [&ctx_server, &validate_api_key, &sparams](const httplib::Request & req, httplib::Response & res) {
+        res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
+        if (!validate_api_key(req, res)) {
+            return;
+        }
+        json data = json::parse(req.body);
+        ctx_server.current_layers = data["current_layers"];
+        ctx_server.host_list = data["host_list"];
+        ctx_server.final_node = data["final_node"];
+
+        std::cout<<"[Dec] handle_worknode_register: next_node_url:"<<data["host_list"]["next_node_url"]<<std::endl;
+    };
+
     const auto handle_worknode_initialize = [&ctx_server, &validate_api_key, &sparams](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
         if (!validate_api_key(req, res)) {
             return;
         }
         std::cout<<"[Dec] handle_worknode_initialize"<<std::endl;
-
-
         json data = json::parse(req.body);
 
         int id_task = json_value(data, "task_id", -1);
+        std::string URL;
+        int start_layer;
+        int end_layer;
+        std::tie(URL, start_layer, end_layer) = ctx_server.current_layers;
+        data["s_layer"] = start_layer;
+        data["e_layer"] = end_layer;
         if(id_task == -1) {
             id_task = ctx_server.queue_tasks.get_new_id();
         }else {
             ctx_server.queue_tasks.set_new_id(id_task);
         }
 
-//        const int id_task = ctx_server.queue_tasks.get_new_id();
-//        ctx_server.id_task_array.push_back(id_task);
         ctx_server.queue_results.add_waiting_task_id(id_task);
-        //ctx_server.task_id = id_task;
         ctx_server.request_completion(id_task, -1, data, false, false);
 
-        if (data["e_layer"] == 31){
-            //...
-//            if (!json_value(data, "stream", false)) {
-//                server_task_result result = ctx_server.queue_results.recv(id_task);
-//                if (!result.error && result.stop) {
-//                    res.set_content(result.data.dump(-1, ' ', false, json::error_handler_t::replace), "application/json; charset=utf-8");
-//                }
-//
-//                ctx_server.queue_results.remove_waiting_task_id(id_task);
-//            } else {
-//                server_task_result result = ctx_server.queue_results.recv(id_task);
-//                if (!result.error) {
-            //...
-//                    const std::string str =
-//                            "data: " +
-//                            result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
-//                            "\n\n";
-//
-//                    LOG_VERBOSE("data stream", {
-//                        { "to_send", str }
-//                    });
-
+        if (ctx_server.final_node){
             std::vector<float> vector_data;//null
             json result_data;
-            //result_data["slot_id"] = result.data["id_slot"];
-            //result_data["token_id"] = result.data["token_id"];
+
             result_data["slot_id"] = -1;
             result_data["token_id"] = 0;
             result_data["ggml_tensor_data"] = vector_data;
-            //result_data["data"] = result.data;
-            result_data["s_layer"] = 0;
-            result_data["e_layer"] = 15;
             result_data["stop"] = false;
             result_data["task_id"] = id_task;
-            //result_data["incomplete"] = result.incomplete;
+
             json jsonArray = json::array();
             jsonArray.push_back(result_data);
             std::string input = jsonArray.dump();
 
             if (ctx_server.queue_results.waiting_task_ids.size()==1) {
-                httplib::Client cli(sparams.host_info["worker1"]);
+                httplib::Client cli(ctx_server.host_list["first_node_url"]);
                 auto forwarded_res = cli.Post("/worknode_notify", input, "application/json");
             }
-//                }
-//                res.set_content("passing success!","text/plain");
-//            }
+
         }else {
-            //server_task_result result = ctx_server.queue_results.recv(id_task);
-            //std::vector<float> vector_data = result.ggml_tensor_data;
 
             json passing_data = json::parse(req.body);
-            passing_data["s_layer"] = 15;
-            passing_data["e_layer"] = 31;
             passing_data["task_id"] = id_task;
-            //passing_data["ggml_tensor_data"] = vector_data;
-            //passing_data["token_id"] = 0;
-            //passing_data["slot_id"] = -1;
-            //passing_data["token"] = "";
-            //passing_data["stop"] = result.stop;
+
             std::string input = passing_data.dump();
 
-            httplib::Client cli(sparams.host_info["worker2"]); // worknode ip address and port
+            httplib::Client cli(ctx_server.host_list["next_node_url"]); // worknode ip address and port
             auto forwarded_res = cli.Post("/worknode_initialize", input, "application/json; charset=utf-8");
         }
 
@@ -3485,11 +3529,36 @@ int main(int argc, char ** argv) {
         if (!validate_api_key(req, res)) {
             return;
         }
+        int nodes_size = ctx_server.host_list.size();
+        auto nodes_layers = ctx_server.pipeline_model_division(PIPELINE_DIVIDE_TYPE_SIZE);
+        for (int i =0; i< nodes_size; i++) {
+            auto &node_layers = nodes_layers[i];
+//            std::string URL;
+//            int start_layer;
+//            int end_layer;
+//            std::tie(URL, start_layer, end_layer) = node_layers;
+            ctx_server.host_list["first_node_url"] = std::get<0>(nodes_layers[0]);
+            ctx_server.host_list["next_node_url"] = std::get<0>(nodes_layers[(i+1)%nodes_size]);
+            json data;
+            data["current_layers"] = node_layers;
+            data["host_list"] = ctx_server.host_list;
+            if (i == nodes_size-2){
+                data["final_node"] = true;
+            }else{
+                data["final_node"] = false;
+            }
+            std::string input = data.dump();
+            if (i < nodes_size-1) {
+                httplib::Client cli(std::get<0>(node_layers)); // worknode1 ip address and port
+                std::cout<<"[Dec] register url:"<<std::get<0>(node_layers)<<std::endl;
+                auto forwarded_res = cli.Post("/worknode_register", input, "application/json");
+            }
+        }
+
+
         std::cout<<"[Dec] hanlde:completions: req body"<<req.body<<std::endl;
         std::vector<float> vector_data;
         json data = json::parse(req.body);
-        data["s_layer"] = 0;
-        data["e_layer"] = 15;
         data["ggml_tensor_data"] = vector_data;
         data["token_id"] = 0;
         data["slot_id"] = -1;
@@ -3498,7 +3567,8 @@ int main(int argc, char ** argv) {
         std::string input = data.dump();
 
         // pass post request.body to worknode 1, and add some new inforation into input
-        httplib::Client cli(sparams.host_info["worker1"]); // worknode1 ip address and port
+        httplib::Client cli(ctx_server.host_list["next_node_url"]); // worknode1 ip address and port
+        std::cout<<"[Dec] next_node_url:"<<ctx_server.host_list["next_node_url"]<<std::endl;
         auto forwarded_res = cli.Post("/worknode_initialize", input, "application/json");
         //...
 
@@ -3509,11 +3579,6 @@ int main(int argc, char ** argv) {
             while (true) {
                 server_task_result result = ctx_server.queue_results.recv(id_task);
                 if (!result.error) {
-
-//                    const std::string str =
-//                            "data: " +
-//                            result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
-//                            "\n\n";
                     const std::string str = result.token;
 
                     LOG_VERBOSE("data stream", {
@@ -3524,7 +3589,6 @@ int main(int argc, char ** argv) {
                         ctx_server.queue_results.remove_waiting_task_id(id_task);
                         return false;
                     }
-
                     if (result.stop) {
                         break;
                     }
@@ -3553,29 +3617,6 @@ int main(int argc, char ** argv) {
             return true;
         };
 
-
-//        const auto chunked_content_provider = [&ctx_server](size_t, httplib::DataSink & sink) {
-//            while (true) {
-//                std::string str = "";
-//                //blocking until receive new result
-//                while(true) {
-//                    if(!ctx_server.results_vector.empty()) {
-//                        str = ctx_server.results_vector[0];
-//                        ctx_server.results_vector.erase(ctx_server.results_vector.begin());
-//                        std::cout<<int(ctx_server.results_vector.size());
-//                        break;
-//                    }
-//                }
-//                if(str != "") {
-//                    sink.write(str.c_str(), str.size());
-//                }
-//                if(ctx_server.stop){
-//                    break;
-//                }
-//            }
-//            sink.done();
-//            return true;
-//        };
         res.set_chunked_content_provider("text/event-stream", chunked_content_provider);
     };
 
@@ -3602,25 +3643,18 @@ int main(int argc, char ** argv) {
                 i++;
 
                 const std::string str = data_input["token"];
-//            const std::string str =
-//                    "data: " +
-//                    result.data.dump(-1, ' ', false, json::error_handler_t::replace) +
-//                    "\n\n";
+
                 std::cout << "[Dec] function: handle_masternode_passing: result.data:" << str << std::endl;
-                //ctx_server.stop = data_input["stop"];
-                //std::string token = data_input["token"];
-                //ctx_server.results_vector.push_back(token); //store result token
                 ctx_server.queue_results.send(result);
             }
             if (data_input["stop"]) {
                 json input_json;
                 input_json = {
-                        {"e_layer", 15},
                         {"task_id", data_input["task_id"]}
 
                 };
                 std::string input = input_json.dump();
-                httplib::Client cli(sparams.host_info["worker1"]);
+                httplib::Client cli(ctx_server.host_list["next_node_url"]);
                 auto forwarded_res = cli.Post("/worknode_release_slot", input, "application/json; charset=utf-8");
             }else{
                 stop = false;
@@ -3628,7 +3662,7 @@ int main(int argc, char ** argv) {
         }
 
         if(!stop){
-            httplib::Client cli(sparams.host_info["worker1"]);
+            httplib::Client cli(ctx_server.host_list["next_node_url"]);
             auto forwarded_res = cli.Post("/worknode_notify", req.body, "application/json");
         }
 
@@ -3640,25 +3674,17 @@ int main(int argc, char ** argv) {
             return;
         }
         std::cout<<"[Dec] handle_worknode_notify"<<std::endl;
-        int e_layer = -1;
-        int s_layer = -1;
+//        int e_layer = -1;
+//        int s_layer = -1;
         json data = json::parse(req.body);
         json jsonArray = json::array();
-//        for (auto &id_task: ctx_server.id_task_array){
-//            int slot_id = -1;
-//            for (auto& slot : ctx_server.slots) {
-//                if (slot.id_task == id_task) {
-//                    slot_id = slot.id;
-//                    break;
-//                }
-//            }
-//
-//        }
+
         // set middle variable to new node
         int i = 0;
         int size = -1;
         for(auto& data_input : data) {
-            s_layer = data_input["s_layer"];
+//            s_layer = data_input["s_layer"];
+//            s_layer = std::get<1>(ctx_server.current_layers);
             size = (json_value(data_input, "size", -1));
             std::cout<<"[Dec] round: "<<i<<std::endl;
             i++;
@@ -3706,43 +3732,16 @@ int main(int argc, char ** argv) {
         size = ctx_server.queue_tasks.queue_post(ctx_server.pending_queue_tasks.queue_tasks, size);
 
         std::cout<<"[Dec] ctx_server.pending_queue_tasks.queue_tasks size: "<<ctx_server.pending_queue_tasks.queue_tasks.size()<<std::endl;
-//        ctx_server.pending_queue_tasks.clear_queue();
 
-//        while (!ctx_server.pending_queue_tasks.queue_tasks.empty()) {
-//            server_task task = ctx_server.pending_queue_tasks.queue_tasks.front();
-//            ctx_server.pending_queue_tasks.queue_tasks.erase(
-//                    ctx_server.pending_queue_tasks.queue_tasks.begin());
-////                    if (task.type == SERVER_TASK_TYPE_NEXT_RESPONSE) {
-////                        task.slot_id = slot_id;
-////                        task.token_id = data_input["token_id"];
-////                        std::vector<float> vector_data = data_input["ggml_tensor_data"];
-////                        task.ggml_tensor_data = vector_data; //vector_data.data();
-////                    } else {
-////            if (task.type == SERVER_TASK_TYPE_COMPLETION){
-////                for(auto& data_input : data){
-////                    if (data_input["slot_id"] == -1){
-////                        std::vector<float> vector_data = data_input["ggml_tensor_data"];
-////                        task.ggml_tensor_data = vector_data;
-////                        break;
-////                    }
-////                }
-////                //vector_data.data();
-////            }
-////                    std::cout << "post_queue: task info: type: " << task.type << std::endl;
-//
-//            ctx_server.pending_queue_tasks.queue_tasks.erase(
-//                    ctx_server.pending_queue_tasks.queue_tasks.begin());
-//
-//            //ctx_server.queue_tasks.post(task);
-//        }
         std::cout << "move task successful!" << std::endl;
 
 
         // recv result error
 //        std::set<int> wait_tasks_id = ctx_server.queue_results.waiting_task_ids;
         for(auto& data_input : data) {
-            if (data_input["e_layer"] == 31) {
-                e_layer = data_input["e_layer"];
+            if (ctx_server.final_node) {
+//                e_layer = data_input["e_layer"];
+//                e_layer = std::get<2>(ctx_server.current_layers);
                 server_task_result result = ctx_server.queue_results.recv(data_input["task_id"]);
                 if (!result.error) {
                     const std::string str =
@@ -3767,18 +3766,11 @@ int main(int argc, char ** argv) {
                     //result_data["data"] = result.data;
                     result_data["token"] = str;
                     std::cout << "[Dec] 3" << std::endl;
-                    result_data["s_layer"] = 0;
-                    result_data["e_layer"] = 15;
                     result_data["stop"] = result.stop;
                     result_data["incomplete"] = result.incomplete;
 
                     jsonArray.push_back(result_data);
                 }
-//                    std::string input = result_data.dump();
-//                    std::cout << "[Dec] 4" << std::endl;
-//                    httplib::Client cli(sparams.host_info["master"]);
-//                    auto forwarded_res = cli.Post("/masternode_passing", input, "application/json; charset=utf-8");
-//                    res.set_content("start worknode success!", "text/plain");
             } else {
                 server_task_result result = ctx_server.queue_results.recv(data_input["task_id"]);
                 std::vector<float> vector_data = result.ggml_tensor_data;
@@ -3789,16 +3781,10 @@ int main(int argc, char ** argv) {
                         {"token_id",         data_input["token_id"]},
                         {"slot_id",          data_input["slot_id"]},
                         {"task_id",          result.id},
-                        {"s_layer",          15},
-                        {"e_layer",          31},
                         {"stop",             data_input["stop"]},
-                        {"size",              size}
+                        {"size",             size}
                 };
                 jsonArray.push_back(input_json);
-//                std::string input = input_json.dump();
-//
-//                httplib::Client cli(sparams.host_info["worker2"]); // worknode ip address and port
-//                auto forwarded_res = cli.Post("/worknode_notify", input, "application/json; charset=utf-8");
 
             }
         }
@@ -3813,19 +3799,17 @@ int main(int argc, char ** argv) {
                     {"token_id",         0},
                     {"slot_id",          -1},
                     {"task_id",          result.id},
-                    {"s_layer",          15},
-                    {"e_layer",          31},
                     {"stop",             false},
             };
             jsonArray.push_back(input_json);
         }
         std::string input = jsonArray.dump();
-        if (e_layer == 31){
+        if (ctx_server.final_node){
             std::cout << "[Dec] 4" << std::endl;
-            httplib::Client cli(sparams.host_info["master"]);
+            httplib::Client cli(ctx_server.host_list["next_node_url"]);
             auto forwarded_res = cli.Post("/masternode_passing", input, "application/json; charset=utf-8");
         }else{
-            httplib::Client cli(sparams.host_info["worker2"]); // worknode ip address and port
+            httplib::Client cli(ctx_server.host_list["next_node_url"]); // worknode ip address and port
             auto forwarded_res = cli.Post("/worknode_notify", input, "application/json; charset=utf-8");
         }
     };
@@ -3849,15 +3833,14 @@ int main(int argc, char ** argv) {
         ctx_server.queue_results.remove_waiting_task_id(id_task);
         //ctx_server.stop = false;
 
-        if (data_input["e_layer"] != 31) {
+        if (!ctx_server.final_node) {
             json input_json;
             input_json = {
-                    {"e_layer",          31},
                     {"task_id",          id_task}
 
             };
             std::string input = input_json.dump();
-            httplib::Client cli(sparams.host_info["worker2"]); // worknode ip address and port
+            httplib::Client cli(ctx_server.host_list["next_node_url"]); // worknode ip address and port
             auto forwarded_res = cli.Post("/worknode_release_slot", input, "application/json; charset=utf-8");
         }
     };
@@ -3871,6 +3854,7 @@ int main(int argc, char ** argv) {
         svr.Post("/worknode_release_slot",      handle_worknode_release_slot);
         // masternode post-processing functions
         svr.Post("/masternode_passing",         handle_masternode_passing);
+        svr.Post("/worknode_register", handle_worknode_register);
     } else {
         // if you want to start llama cpp by single node
         svr.Post("/completion",             completions);

@@ -13367,6 +13367,11 @@ uint64_t llama_model_size(const struct llama_model * model) {
     return size;
 }
 
+uint64_t llama_model_layers(const struct llama_model * model) {
+
+    return model->hparams.n_layer;
+}
+
 uint64_t llama_model_n_params(const struct llama_model * model) {
     uint64_t nparams = 0;
     for (const auto & it : model->tensors_by_name) {
