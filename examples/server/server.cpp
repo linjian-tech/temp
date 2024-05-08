@@ -258,6 +258,7 @@ struct server_slot {
     }
 
     bool available() const {
+        std::cout<<"[Dec] state: "<<state<<" command: "<<command<<std::endl;
         return state == SLOT_STATE_IDLE && command == SLOT_COMMAND_NONE;
     }
 
@@ -276,6 +277,7 @@ struct server_slot {
         if (state == SLOT_STATE_PROCESSING) {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
             command = SLOT_COMMAND_RELEASE;
+            std::cout<<"[Dec] release----"<<std::endl;
         }
     }
 
@@ -737,7 +739,10 @@ struct server_context {
     std::tuple<std::string, int, int> current_layers;
     std::tuple<std::string, int, int> next_layers;
     bool final_node = false;
+    bool divide_flag = false;
     std::unordered_map<std::string, std::string> host_list;
+    std::set<int> wait_tasks_id;
+    std::unordered_map<int, int> slave_host_task_id;
 
     ~server_context() {
         if (ctx) {
@@ -948,6 +953,7 @@ struct server_context {
             if (slot.available() && slot.t_last_used < t_last) {
                 last_used = &slot;
                 t_last = slot.t_last_used;
+                break;
             }
         }
 
@@ -1799,6 +1805,7 @@ struct server_context {
                 slot.state       = SLOT_STATE_IDLE;
                 slot.command     = SLOT_COMMAND_NONE;
                 slot.t_last_used = ggml_time_us();
+                std::cout<<"[Dec] slot.state       = SLOT_STATE_IDLE"<<std::endl;
 
                 LOG_INFO("slot released", {
                     {"id_slot",         slot.id},
@@ -3488,6 +3495,10 @@ int main(int argc, char ** argv) {
             ctx_server.queue_tasks.set_new_id(id_task);
         }
 
+        int host_task_id = data["host_task_id"];
+        std::cout<<"[Dec] ini: slave_host_task_id: slave:"<<id_task<<" host: "<<host_task_id<<std::endl;
+        ctx_server.slave_host_task_id[id_task] = host_task_id;
+
         ctx_server.queue_results.add_waiting_task_id(id_task);
         ctx_server.request_completion(id_task, -1, data, false, false);
 
@@ -3504,7 +3515,7 @@ int main(int argc, char ** argv) {
             json jsonArray = json::array();
             jsonArray.push_back(result_data);
             std::string input = jsonArray.dump();
-
+            std::cout<<"[Dec] ctx_server.queue_results.waiting_task_ids.size(): "<<ctx_server.queue_results.waiting_task_ids.size()<<std::endl;
             if (ctx_server.queue_results.waiting_task_ids.size()==1) {
                 httplib::Client cli(ctx_server.host_list["first_node_url"]);
                 auto forwarded_res = cli.Post("/worknode_notify", input, "application/json");
@@ -3529,30 +3540,34 @@ int main(int argc, char ** argv) {
         if (!validate_api_key(req, res)) {
             return;
         }
-        int nodes_size = ctx_server.host_list.size();
-        auto nodes_layers = ctx_server.pipeline_model_division(PIPELINE_DIVIDE_TYPE_SIZE);
-        for (int i =0; i< nodes_size; i++) {
-            auto &node_layers = nodes_layers[i];
+        if(!ctx_server.divide_flag) {
+            int nodes_size = ctx_server.host_list.size();
+            auto nodes_layers = ctx_server.pipeline_model_division(PIPELINE_DIVIDE_TYPE_SIZE);
+            for (int i = 0; i < nodes_size; i++) {
+                auto &node_layers = nodes_layers[i];
 //            std::string URL;
 //            int start_layer;
 //            int end_layer;
 //            std::tie(URL, start_layer, end_layer) = node_layers;
-            ctx_server.host_list["first_node_url"] = std::get<0>(nodes_layers[0]);
-            ctx_server.host_list["next_node_url"] = std::get<0>(nodes_layers[(i+1)%nodes_size]);
-            json data;
-            data["current_layers"] = node_layers;
-            data["host_list"] = ctx_server.host_list;
-            if (i == nodes_size-2){
-                data["final_node"] = true;
-            }else{
-                data["final_node"] = false;
+                ctx_server.host_list["first_node_url"] = std::get<0>(nodes_layers[0]);
+                ctx_server.host_list["next_node_url"] = std::get<0>(nodes_layers[(i + 1) % nodes_size]);
+                json data;
+                data["current_layers"] = node_layers;
+                data["host_list"] = ctx_server.host_list;
+                if (i == nodes_size - 2) {
+                    data["final_node"] = true;
+                } else {
+                    data["final_node"] = false;
+                }
+                std::string input = data.dump();
+                if (i < nodes_size - 1) {
+                    httplib::Client cli(std::get<0>(node_layers)); // worknode1 ip address and port
+                    std::cout << "[Dec] register url:" << std::get<0>(node_layers) << std::endl;
+                    auto forwarded_res = cli.Post("/worknode_register", input, "application/json");
+                }
             }
-            std::string input = data.dump();
-            if (i < nodes_size-1) {
-                httplib::Client cli(std::get<0>(node_layers)); // worknode1 ip address and port
-                std::cout<<"[Dec] register url:"<<std::get<0>(node_layers)<<std::endl;
-                auto forwarded_res = cli.Post("/worknode_register", input, "application/json");
-            }
+
+            ctx_server.divide_flag = true;
         }
 
 
@@ -3563,7 +3578,8 @@ int main(int argc, char ** argv) {
         data["token_id"] = 0;
         data["slot_id"] = -1;
         data["token"] = "";
-
+        ctx_server.task_id += 1;
+        data["host_task_id"] = ctx_server.task_id;
         std::string input = data.dump();
 
         // pass post request.body to worknode 1, and add some new inforation into input
@@ -3572,9 +3588,12 @@ int main(int argc, char ** argv) {
         auto forwarded_res = cli.Post("/worknode_initialize", input, "application/json");
         //...
 
-        ctx_server.task_id++;
+
         int id_task = ctx_server.task_id;
         ctx_server.queue_results.add_waiting_task_id(id_task);
+        for (auto& id_ : ctx_server.queue_results.waiting_task_ids){
+            std::cout<<"waiting_task_ids id: "<<id_ <<std::endl;
+        }
         const auto chunked_content_provider = [id_task, &ctx_server](size_t, httplib::DataSink & sink) {
             while (true) {
                 server_task_result result = ctx_server.queue_results.recv(id_task);
@@ -3631,15 +3650,19 @@ int main(int argc, char ** argv) {
         bool stop = true;
         json data = json::parse(req.body);
         int i = 0;
+        std::vector<int> stop_slot;
         for (auto& data_input : data) {
             if (!data_input["incomplete"]) {
                 server_task_result result;
                 result.stop = data_input["stop"];
+                std::cout << "[Dec] function: handle_masternode_passing: stop:" << data_input["stop"] << std::endl;
 //            result.data = data_input["data"];
                 result.token = data_input["token"];
                 result.error = false;
-//                result.id = ctx_server.task_id;
-                result.id = i;
+                //result.id = ctx_server.task_id;
+                std::unordered_map<int, int> slave_host_task_id = data_input["slave_host_task_id"];
+                result.id = slave_host_task_id[data_input["task_id"]];
+                std::cout<<"[Dec] passing: slave_host_task_id: slave:"<<data_input["task_id"]<<" host: "<<result.id<<std::endl;
                 i++;
 
                 const std::string str = data_input["token"];
@@ -3648,6 +3671,8 @@ int main(int argc, char ** argv) {
                 ctx_server.queue_results.send(result);
             }
             if (data_input["stop"]) {
+                stop_slot.push_back(i);
+                std::cout<<"[Dec] stop slot id if: "<<i<<std::endl;
                 json input_json;
                 input_json = {
                         {"task_id", data_input["task_id"]}
@@ -3660,10 +3685,14 @@ int main(int argc, char ** argv) {
                 stop = false;
             }
         }
-
+        for(int slot_id_input: stop_slot){
+            data.erase(slot_id_input);
+            std::cout<<"[Dec] stop slot id: "<<slot_id_input<<std::endl;
+        }
         if(!stop){
+            std::string input = data.dump();
             httplib::Client cli(ctx_server.host_list["next_node_url"]);
-            auto forwarded_res = cli.Post("/worknode_notify", req.body, "application/json");
+            auto forwarded_res = cli.Post("/worknode_notify", input, "application/json");
         }
 
     };
@@ -3707,12 +3736,12 @@ int main(int argc, char ** argv) {
 //            }
         }
         // notify new task
-//        std::set<int> wait_tasks_id;
-        int wait_task_id = -1;
+
+//        int wait_task_id = -1;
         for (auto& task: ctx_server.pending_queue_tasks.queue_tasks){
             if (task.type == SERVER_TASK_TYPE_COMPLETION){
-//                wait_tasks_id.insert(task.id);
-                wait_task_id = task.id;
+                ctx_server.wait_tasks_id.insert(task.id);
+//                wait_task_id = task.id;
                 std::cout<<"[Dec] task.id: "<<task.id<<std::endl;
                 for(auto& data_input : data){
                     if (data_input["slot_id"] == -1){
@@ -3739,6 +3768,8 @@ int main(int argc, char ** argv) {
         // recv result error
 //        std::set<int> wait_tasks_id = ctx_server.queue_results.waiting_task_ids;
         for(auto& data_input : data) {
+            ctx_server.wait_tasks_id.erase(data_input["task_id"]);
+            std::cout<<"[Dec] data_input[task_id]: "<<data_input["task_id"]<<std::endl;
             if (ctx_server.final_node) {
 //                e_layer = data_input["e_layer"];
 //                e_layer = std::get<2>(ctx_server.current_layers);
@@ -3767,8 +3798,10 @@ int main(int argc, char ** argv) {
                     result_data["token"] = str;
                     std::cout << "[Dec] 3" << std::endl;
                     result_data["stop"] = result.stop;
+                    std::cout << "[Dec] 3.stop" << result_data["stop"]<< std::endl;
                     result_data["incomplete"] = result.incomplete;
 
+                    result_data["slave_host_task_id"] = ctx_server.slave_host_task_id;
                     jsonArray.push_back(result_data);
                 }
             } else {
@@ -3788,20 +3821,29 @@ int main(int argc, char ** argv) {
 
             }
         }
-        if (ctx_server.queue_results.queue_results.size() > 0){
-            std::cout<<"[Dec] ctx_server.queue_results.queue_results.size():"<<ctx_server.queue_results.queue_results.size()<<std::endl;
-            server_task_result result = ctx_server.queue_results.recv(wait_task_id);
-            std::vector<float> vector_data = result.ggml_tensor_data;
-            json input_json;
+//        if (ctx_server.queue_results.queue_results.size() > 0){
+        while(ctx_server.wait_tasks_id.size() > 0){
+            int x = *(ctx_server.wait_tasks_id.begin());
+            if(ctx_server.host_list["first_node_url"] == std::get<0>(ctx_server.current_layers)) {
 
-            input_json = {
-                    {"ggml_tensor_data", vector_data},
-                    {"token_id",         0},
-                    {"slot_id",          -1},
-                    {"task_id",          result.id},
-                    {"stop",             false},
-            };
-            jsonArray.push_back(input_json);
+                std::cout<<"ctx_server.host_list first_node_url: "<< std::get<0>(ctx_server.current_layers)<<std::endl;
+                std::cout<<"[Dec] wait_tasks_id.size():"<< ctx_server.wait_tasks_id.size()<<" and x:"<<x<<std::endl;
+                std::cout << "[Dec] ctx_server.queue_results.queue_results.size():"
+                          << ctx_server.queue_results.queue_results.size() << std::endl;
+                server_task_result result = ctx_server.queue_results.recv(x);
+                std::vector<float> vector_data = result.ggml_tensor_data;
+                json input_json;
+
+                input_json = {
+                        {"ggml_tensor_data", vector_data},
+                        {"token_id",         0},
+                        {"slot_id",          -1},
+                        {"task_id",          result.id},
+                        {"stop",             false},
+                };
+                jsonArray.push_back(input_json);
+            }
+            ctx_server.wait_tasks_id.erase(x);
         }
         std::string input = jsonArray.dump();
         if (ctx_server.final_node){

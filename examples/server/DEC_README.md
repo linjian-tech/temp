@@ -22,7 +22,7 @@ server is build alongside everything else from the root of the project
 - Using `make`:
 
   ```bash
-  make
+  make server
   ```
 
 - Using `CMake`:
