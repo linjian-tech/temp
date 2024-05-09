@@ -25,7 +25,7 @@ while IFS=' ' read -r key value || [[ -n "$key" ]]; do
   port=$((${parts[1]}))
 
   if [ "$host" == "$1" ]; then
-    $(./server -m  models/7B/ggml-model-f16.gguf -c 2048 --host $host --port $port --hostfile examples/server/multihosts -np 2 -cb) &
+    $(./server -m  models/7B/ggml-model-f16.gguf -c 2048 --host $host --port $port --hostfile examples/server/multihosts) &
     #$(./server -m  ~/.cache/huggingface/hub/models--TheBloke--Mixtral-8x7B-Instruct-v0.1-GGUF/snapshots/fa1d3835c5d45a3a74c0b68805fcdc133dba2b6a/mixtral-8x7b-instruct-v0.1.Q4_K_M.gguf -c 2048 --host $host --port $port --hostfile examples/server/multihosts -np 2 -cb) &
   fi
 done < ./examples/server/multihosts
